@@ -27,10 +27,11 @@ import argparse
 import csv
 import io
 import json
+import os
 import sys
 import time
 from dataclasses import dataclass, asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 try:
@@ -191,30 +192,85 @@ def evaluate_symbol(symbol: str, cfg: ScreenerConfig = DEFAULT_CONFIG) -> Candid
 
 
 # ---------------------------------------------------------------------------
+# 個股快取（記錄上次檢查時間，避免短時間內重複打 Yahoo Finance）
+# ---------------------------------------------------------------------------
+def _cache_is_fresh(entry: dict, freshness_hours: float) -> bool:
+    checked_at = entry.get("checked_at")
+    if not checked_at:
+        return False
+    try:
+        checked_dt = datetime.fromisoformat(checked_at.replace("Z", "+00:00"))
+    except Exception:
+        return False
+    if checked_dt.tzinfo is None:
+        checked_dt = checked_dt.replace(tzinfo=timezone.utc)
+    age_hours = (datetime.now(timezone.utc) - checked_dt).total_seconds() / 3600
+    return age_hours < freshness_hours
+
+
+def _result_from_cache_entry(symbol: str, entry: dict) -> CandidateResult:
+    return CandidateResult(
+        symbol=symbol,
+        passed=entry.get("passed", False),
+        fail_reasons=entry.get("fail_reasons", []),
+        name=entry.get("name"),
+        exchange=entry.get("exchange"),
+        market_cap=entry.get("market_cap"),
+        price=entry.get("price"),
+        price_to_sales=entry.get("price_to_sales"),
+        week52_low=entry.get("week52_low"),
+        week52_high=entry.get("week52_high"),
+        range_position_pct=entry.get("range_position_pct"),
+        avg_volume=entry.get("avg_volume"),
+    )
+
+
+# ---------------------------------------------------------------------------
 # 批次執行
 # ---------------------------------------------------------------------------
 def run_screener(symbols: list, cfg: ScreenerConfig = DEFAULT_CONFIG, verbose: bool = True,
-                  progress_callback=None) -> dict:
+                  progress_callback=None, cache: Optional[dict] = None,
+                  freshness_hours: float = 24.0) -> dict:
     """
-    progress_callback(i, total, symbol, passed_so_far) 會在每檔股票處理完後被呼叫，
-    供後端 API 回報即時進度（例如寫入 job 狀態供前端輪詢）。
+    progress_callback(i, total, symbol, passed_so_far, from_cache) 會在每檔股票處理完後被呼叫，
+    供後端 API 回報即時進度。
+
+    cache: 一個 {symbol: {...評估結果欄位..., "checked_at": iso時間}} 的字典（會被就地修改）。
+           若某檔股票在 cache 內且 checked_at 距今小於 freshness_hours，就直接沿用快取結果，
+           不會再對 Yahoo Finance 發送請求，也不會計入速率限制的 sleep。
     """
+    if cache is None:
+        cache = {}
+
     results = []
     total = len(symbols)
     passed_so_far = 0
+    cache_hits = 0
+    fresh_fetches = 0
+
     for i, sym in enumerate(symbols, 1):
-        if verbose and i % 25 == 0:
-            print(f"[{i}/{total}] 處理中... 最新: {sym}", file=sys.stderr)
-        result = evaluate_symbol(sym, cfg)
+        entry = cache.get(sym)
+        from_cache = entry is not None and _cache_is_fresh(entry, freshness_hours)
+
+        if from_cache:
+            result = _result_from_cache_entry(sym, entry)
+            cache_hits += 1
+        else:
+            if verbose and i % 25 == 0:
+                print(f"[{i}/{total}] 處理中... 最新: {sym}", file=sys.stderr)
+            result = evaluate_symbol(sym, cfg)
+            cache[sym] = {**asdict(result), "checked_at": datetime.utcnow().isoformat() + "Z"}
+            fresh_fetches += 1
+            time.sleep(cfg.request_delay_sec)  # 只有真正打 API 才需要限速
+
         results.append(result)
         if result.passed:
             passed_so_far += 1
         if progress_callback:
             try:
-                progress_callback(i, total, sym, passed_so_far)
+                progress_callback(i, total, sym, passed_so_far, from_cache)
             except Exception:
                 pass
-        time.sleep(cfg.request_delay_sec)
 
     passed = [asdict(r) for r in results if r.passed]
     # AMEX 需人工複核，故標註出來但不自動排除
@@ -227,6 +283,8 @@ def run_screener(symbols: list, cfg: ScreenerConfig = DEFAULT_CONFIG, verbose: b
         "config": asdict(cfg),
         "universe_size": total,
         "candidate_count": len(passed),
+        "cache_hits": cache_hits,
+        "fresh_fetches": fresh_fetches,
         "candidates": sorted(passed, key=lambda x: x.get("range_position_pct") or 0, reverse=True),
     }
 
@@ -242,6 +300,9 @@ def main():
     parser.add_argument("--ps-max", type=float, default=DEFAULT_CONFIG.ps_ratio_max)
     parser.add_argument("--range-min", type=float, default=DEFAULT_CONFIG.range_position_min)
     parser.add_argument("--volume-min", type=float, default=DEFAULT_CONFIG.avg_volume_min)
+    parser.add_argument("--cache-file", help="個股快取檔路徑，重複執行時可跳過近期已檢查過的股票")
+    parser.add_argument("--cache-max-age-hours", type=float, default=24.0,
+                         help="快取有效時數，超過這個時數的個股資料視為過期，會重新查詢")
     args = parser.parse_args()
 
     if args.symbols:
@@ -264,11 +325,21 @@ def main():
         avg_volume_min=args.volume_min,
     )
 
-    output = run_screener(symbols, cfg)
+    cache = {}
+    if args.cache_file and os.path.exists(args.cache_file):
+        with open(args.cache_file, encoding="utf-8") as f:
+            cache = json.load(f)
+
+    output = run_screener(symbols, cfg, cache=cache, freshness_hours=args.cache_max_age_hours)
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
 
+    if args.cache_file:
+        with open(args.cache_file, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+
     print(f"\n完成！從 {output['universe_size']} 檔中篩選出 {output['candidate_count']} 檔候選股", file=sys.stderr)
+    print(f"（快取命中 {output['cache_hits']} 檔，實際查詢 {output['fresh_fetches']} 檔）", file=sys.stderr)
     print(f"結果已寫入 {args.out}", file=sys.stderr)
 
 

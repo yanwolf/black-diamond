@@ -29,6 +29,9 @@ app = FastAPI(title="黑鑽選股系統 API")
 scheduler = BackgroundScheduler(timezone="UTC")
 SCHEDULE_JOB_ID = "full_market_scan"
 
+# 個股快取有效時數：這段時間內已檢查過的股票，重新掃描時會直接沿用結果，不再打 Yahoo Finance
+CACHE_FRESHNESS_HOURS = float(os.environ.get("CACHE_FRESHNESS_HOURS", 24))
+
 # 若前端與後端分開部署（不同網域），需要開放 CORS；同源部署則此設定無害。
 app.add_middleware(
     CORSMiddleware,
@@ -161,6 +164,8 @@ _job_state = {
     "total": 0,
     "current_symbol": None,
     "passed_so_far": 0,
+    "cache_hits": 0,
+    "fresh_fetches": 0,
     "error": None,
     "finished_at": None,
 }
@@ -172,15 +177,25 @@ def _now_iso():
 
 def _run_job(symbols, cfg: ScreenerConfig, mode: str):
     global _job_state
+    cache = storage.load("symbol_cache") or {}
     try:
-        def on_progress(i, total, symbol, passed_so_far):
+        def on_progress(i, total, symbol, passed_so_far, from_cache):
             with _job_lock:
                 _job_state.update(
-                    processed=i, total=total, current_symbol=symbol, passed_so_far=passed_so_far
+                    processed=i, total=total, current_symbol=symbol, passed_so_far=passed_so_far,
+                    cache_hits=_job_state["cache_hits"] + (1 if from_cache else 0),
+                    fresh_fetches=_job_state["fresh_fetches"] + (0 if from_cache else 1),
                 )
+            if i % 25 == 0:
+                # 週期性把快取存檔，若中途被中斷（例如服務重啟），下次重跑不用從頭全部重查
+                storage.save("symbol_cache", cache)
 
-        result = run_screener(symbols, cfg, verbose=False, progress_callback=on_progress)
+        result = run_screener(
+            symbols, cfg, verbose=False, progress_callback=on_progress,
+            cache=cache, freshness_hours=CACHE_FRESHNESS_HOURS,
+        )
         storage.save("candidates", result)
+        storage.save("symbol_cache", cache)
         with _job_lock:
             _job_state["error"] = None
         if mode == "nasdaq":
@@ -189,6 +204,7 @@ def _run_job(symbols, cfg: ScreenerConfig, mode: str):
             sched["last_result_count"] = result.get("candidate_count")
             storage.save("schedule", sched)
     except Exception as e:
+        storage.save("symbol_cache", cache)  # 就算失敗也保留已查到的部分，避免全部浪費
         with _job_lock:
             _job_state["error"] = str(e)
     finally:
@@ -204,7 +220,7 @@ def _start_job(symbols, cfg: ScreenerConfig, mode: str) -> bool:
             return False
         _job_state.update(
             running=True, mode=mode, processed=0, total=len(symbols), current_symbol=None,
-            passed_so_far=0, error=None, finished_at=None,
+            passed_so_far=0, cache_hits=0, fresh_fetches=0, error=None, finished_at=None,
         )
     thread = threading.Thread(target=_run_job, args=(symbols, cfg, mode), daemon=True)
     thread.start()
@@ -316,6 +332,21 @@ def put_schedule(cfg: ScheduleConfig):
         "last_result_count": storage.load("schedule").get("last_result_count"),
     })
     return saved
+
+
+# ---------------------------------------------------------------------------
+# 個股快取
+# ---------------------------------------------------------------------------
+@app.get("/api/cache/stats")
+def cache_stats():
+    cache = storage.load("symbol_cache") or {}
+    return {"cached_symbols": len(cache), "freshness_hours": CACHE_FRESHNESS_HOURS}
+
+
+@app.delete("/api/cache")
+def clear_cache():
+    storage.save("symbol_cache", {})
+    return {"cleared": True}
 
 
 # ---------------------------------------------------------------------------

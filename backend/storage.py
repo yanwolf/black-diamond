@@ -29,6 +29,7 @@ DEFAULTS = {
         "last_result_count": None,
         "next_run_at": None,
     },
+    "symbol_cache": {},
 }
 
 
