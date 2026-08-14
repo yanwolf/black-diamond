@@ -125,6 +125,19 @@ def load_universe_csv(path: str) -> list:
 # ---------------------------------------------------------------------------
 # 單檔股票評估
 # ---------------------------------------------------------------------------
+def _to_float(val):
+    """安全轉成 float；yfinance 對少數股票偶爾會回傳字串、'Infinity'、或其他非數值型態。"""
+    if val is None:
+        return None
+    try:
+        f = float(val)
+    except (TypeError, ValueError):
+        return None
+    if f != f or f in (float("inf"), float("-inf")):  # NaN / Infinity
+        return None
+    return f
+
+
 def evaluate_symbol(symbol: str, cfg: ScreenerConfig = DEFAULT_CONFIG) -> CandidateResult:
     fail_reasons = []
     try:
@@ -133,62 +146,67 @@ def evaluate_symbol(symbol: str, cfg: ScreenerConfig = DEFAULT_CONFIG) -> Candid
     except Exception as e:
         return CandidateResult(symbol=symbol, passed=False, fail_reasons=[f"資料取得失敗: {e}"])
 
-    name = info.get("shortName") or info.get("longName")
-    exchange = info.get("exchange") or info.get("fullExchangeName")
-    market_cap = info.get("marketCap")
-    price = info.get("currentPrice") or info.get("regularMarketPrice")
-    price_to_sales = info.get("priceToSalesTrailing12Months")
-    week52_low = info.get("fiftyTwoWeekLow")
-    week52_high = info.get("fiftyTwoWeekHigh")
-    avg_volume = info.get("averageVolume") or info.get("averageDailyVolume10Day")
+    try:
+        name = info.get("shortName") or info.get("longName")
+        exchange = info.get("exchange") or info.get("fullExchangeName")
+        market_cap = _to_float(info.get("marketCap"))
+        price = _to_float(info.get("currentPrice") or info.get("regularMarketPrice"))
+        price_to_sales = _to_float(info.get("priceToSalesTrailing12Months"))
+        week52_low = _to_float(info.get("fiftyTwoWeekLow"))
+        week52_high = _to_float(info.get("fiftyTwoWeekHigh"))
+        avg_volume = _to_float(info.get("averageVolume") or info.get("averageDailyVolume10Day"))
 
-    range_position_pct = None
-    if price is not None and week52_low is not None and week52_high is not None and week52_high > week52_low:
-        range_position_pct = (price - week52_low) / (week52_high - week52_low)
+        range_position_pct = None
+        if price is not None and week52_low is not None and week52_high is not None and week52_high > week52_low:
+            range_position_pct = (price - week52_low) / (week52_high - week52_low)
 
-    # --- 套用6道濾網 ---
-    if market_cap is None:
-        fail_reasons.append("無市值資料")
-    elif not (cfg.market_cap_min <= market_cap <= cfg.market_cap_max):
-        fail_reasons.append(f"市值 {market_cap:,.0f} 不在 {cfg.market_cap_min:,.0f}~{cfg.market_cap_max:,.0f} 範圍")
+        # --- 套用6道濾網 ---
+        if market_cap is None:
+            fail_reasons.append("無市值資料")
+        elif not (cfg.market_cap_min <= market_cap <= cfg.market_cap_max):
+            fail_reasons.append(f"市值 {market_cap:,.0f} 不在 {cfg.market_cap_min:,.0f}~{cfg.market_cap_max:,.0f} 範圍")
 
-    if price_to_sales is None:
-        fail_reasons.append("無 P/S 資料")
-    elif price_to_sales > cfg.ps_ratio_max:
-        fail_reasons.append(f"P/S {price_to_sales:.2f} 超過 {cfg.ps_ratio_max}")
+        if price_to_sales is None:
+            fail_reasons.append("無 P/S 資料")
+        elif price_to_sales > cfg.ps_ratio_max:
+            fail_reasons.append(f"P/S {price_to_sales:.2f} 超過 {cfg.ps_ratio_max}")
 
-    if range_position_pct is None:
-        fail_reasons.append("無法計算52週區間位置")
-    elif range_position_pct < cfg.range_position_min:
-        fail_reasons.append(f"52週區間位置 {range_position_pct*100:.1f}% 低於 {cfg.range_position_min*100:.0f}%")
+        if range_position_pct is None:
+            fail_reasons.append("無法計算52週區間位置")
+        elif range_position_pct < cfg.range_position_min:
+            fail_reasons.append(f"52週區間位置 {range_position_pct*100:.1f}% 低於 {cfg.range_position_min*100:.0f}%")
 
-    if avg_volume is None:
-        fail_reasons.append("無成交量資料")
-    elif avg_volume < cfg.avg_volume_min:
-        fail_reasons.append(f"平均成交量 {avg_volume:,.0f} 低於 {cfg.avg_volume_min:,.0f}")
+        if avg_volume is None:
+            fail_reasons.append("無成交量資料")
+        elif avg_volume < cfg.avg_volume_min:
+            fail_reasons.append(f"平均成交量 {avg_volume:,.0f} 低於 {cfg.avg_volume_min:,.0f}")
 
-    if price is None:
-        fail_reasons.append("無股價資料")
-    elif price < cfg.price_min:
-        fail_reasons.append(f"股價 {price} 低於 {cfg.price_min}")
+        if price is None:
+            fail_reasons.append("無股價資料")
+        elif price < cfg.price_min:
+            fail_reasons.append(f"股價 {price} 低於 {cfg.price_min}")
 
-    if cfg.exclude_otc and exchange and "OTC" in exchange.upper():
-        fail_reasons.append("交易所為 OTC")
+        if cfg.exclude_otc and exchange and "OTC" in str(exchange).upper():
+            fail_reasons.append("交易所為 OTC")
 
-    return CandidateResult(
-        symbol=symbol,
-        passed=len(fail_reasons) == 0,
-        fail_reasons=fail_reasons,
-        name=name,
-        exchange=exchange,
-        market_cap=market_cap,
-        price=price,
-        price_to_sales=price_to_sales,
-        week52_low=week52_low,
-        week52_high=week52_high,
-        range_position_pct=round(range_position_pct * 100, 2) if range_position_pct is not None else None,
-        avg_volume=avg_volume,
-    )
+        return CandidateResult(
+            symbol=symbol,
+            passed=len(fail_reasons) == 0,
+            fail_reasons=fail_reasons,
+            name=name,
+            exchange=exchange,
+            market_cap=market_cap,
+            price=price,
+            price_to_sales=price_to_sales,
+            week52_low=week52_low,
+            week52_high=week52_high,
+            range_position_pct=round(range_position_pct * 100, 2) if range_position_pct is not None else None,
+            avg_volume=avg_volume,
+        )
+    except Exception as e:
+        # 單一股票的資料異常（型態不符、缺欄位等）不應讓整批掃描中斷，
+        # 記錄成該股票的失敗原因即可，其餘股票繼續處理。
+        return CandidateResult(symbol=symbol, passed=False, fail_reasons=[f"評估時發生錯誤: {e}"])
 
 
 # ---------------------------------------------------------------------------
@@ -252,16 +270,21 @@ def run_screener(symbols: list, cfg: ScreenerConfig = DEFAULT_CONFIG, verbose: b
         entry = cache.get(sym)
         from_cache = entry is not None and _cache_is_fresh(entry, freshness_hours)
 
-        if from_cache:
-            result = _result_from_cache_entry(sym, entry)
-            cache_hits += 1
-        else:
-            if verbose and i % 25 == 0:
-                print(f"[{i}/{total}] 處理中... 最新: {sym}", file=sys.stderr)
-            result = evaluate_symbol(sym, cfg)
-            cache[sym] = {**asdict(result), "checked_at": datetime.utcnow().isoformat() + "Z"}
+        try:
+            if from_cache:
+                result = _result_from_cache_entry(sym, entry)
+                cache_hits += 1
+            else:
+                if verbose and i % 25 == 0:
+                    print(f"[{i}/{total}] 處理中... 最新: {sym}", file=sys.stderr)
+                result = evaluate_symbol(sym, cfg)
+                cache[sym] = {**asdict(result), "checked_at": datetime.utcnow().isoformat() + "Z"}
+                fresh_fetches += 1
+                time.sleep(cfg.request_delay_sec)  # 只有真正打 API 才需要限速
+        except Exception as e:
+            # 保底：就算 evaluate_symbol 內部的防呆沒接住，也不能讓單一股票拖垮整批掃描
+            result = CandidateResult(symbol=sym, passed=False, fail_reasons=[f"處理時發生未預期錯誤: {e}"])
             fresh_fetches += 1
-            time.sleep(cfg.request_delay_sec)  # 只有真正打 API 才需要限速
 
         results.append(result)
         if result.passed:
@@ -275,7 +298,7 @@ def run_screener(symbols: list, cfg: ScreenerConfig = DEFAULT_CONFIG, verbose: b
     passed = [asdict(r) for r in results if r.passed]
     # AMEX 需人工複核，故標註出來但不自動排除
     for c in passed:
-        if c.get("exchange") and "AMEX" in c["exchange"].upper():
+        if c.get("exchange") and "AMEX" in str(c["exchange"]).upper():
             c["needs_manual_review"] = "AMEX 交易所，請人工複核是否排除"
 
     return {
