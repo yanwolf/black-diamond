@@ -21,6 +21,8 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
+import yfinance as yf
+import pandas as pd
 
 import storage
 from engine import ScreenerConfig, run_screener, fetch_nasdaq_universe
@@ -347,6 +349,53 @@ def cache_stats():
 def clear_cache():
     storage.save("symbol_cache", {})
     return {"cleared": True}
+
+
+# ---------------------------------------------------------------------------
+# 個股歷史線圖（供人工判斷5年線型態用）
+# ---------------------------------------------------------------------------
+_chart_cache_lock = threading.Lock()
+_chart_cache = {}  # f"{symbol}:{period}:{interval}" -> (timestamp, payload)
+CHART_CACHE_TTL_SECONDS = 6 * 3600  # 同一檔股票6小時內重複開圖不用再打一次 yfinance
+
+
+@app.get("/api/chart/{symbol}")
+def get_chart(symbol: str, period: str = "5y", interval: str = "1wk"):
+    symbol = symbol.strip().upper()
+    cache_key = f"{symbol}:{period}:{interval}"
+
+    with _chart_cache_lock:
+        cached = _chart_cache.get(cache_key)
+        if cached and (time.time() - cached[0]) < CHART_CACHE_TTL_SECONDS:
+            return cached[1]
+
+    try:
+        ticker = yf.Ticker(symbol)
+        hist = ticker.history(period=period, interval=interval)
+    except Exception as e:
+        raise HTTPException(502, f"取得 {symbol} 歷史股價失敗: {e}")
+
+    if hist is None or hist.empty:
+        raise HTTPException(404, f"查無 {symbol} 的歷史股價資料")
+
+    def safe_float(v):
+        return None if v is None or pd.isna(v) else round(float(v), 4)
+
+    points = []
+    for idx, row in hist.iterrows():
+        points.append({
+            "date": idx.strftime("%Y-%m-%d"),
+            "open": safe_float(row.get("Open")),
+            "high": safe_float(row.get("High")),
+            "low": safe_float(row.get("Low")),
+            "close": safe_float(row.get("Close")),
+            "volume": None if pd.isna(row.get("Volume")) else int(row.get("Volume")),
+        })
+
+    payload = {"symbol": symbol, "period": period, "interval": interval, "points": points}
+    with _chart_cache_lock:
+        _chart_cache[cache_key] = (time.time(), payload)
+    return payload
 
 
 # ---------------------------------------------------------------------------
