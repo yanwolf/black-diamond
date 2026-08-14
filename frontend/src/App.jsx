@@ -362,7 +362,7 @@ function ScreenTab({ candidates, importCandidates, clearCandidates, sortKey, sor
   const [schedule, setSchedule] = useState(null);
   const [scheduleError, setScheduleError] = useState("");
   const [scheduleSaving, setScheduleSaving] = useState(false);
-  const [intervalDraft, setIntervalDraft] = useState(24);
+  const [intervalDraft, setIntervalDraft] = useState(168);
 
   const loadSchedule = useCallback(async () => {
     try {
@@ -394,7 +394,7 @@ function ScreenTab({ candidates, importCandidates, clearCandidates, sortKey, sor
     try {
       const s = await apiSend("PUT", "/scan/schedule", {
         enabled,
-        interval_hours: Number(intervalDraft) || 24,
+        interval_hours: Number(intervalDraft) || 168,
       });
       setSchedule(s);
     } catch (e) {
@@ -534,16 +534,19 @@ function ScreenTab({ candidates, importCandidates, clearCandidates, sortKey, sor
           {schedule ? (
             <div style={{ display: "flex", alignItems: "flex-end", gap: 16, flexWrap: "wrap", marginTop: 6 }}>
               <div>
-                <MiniLabel>每隔幾小時掃描一次</MiniLabel>
+                <MiniLabel>每隔幾小時掃描一次（約 {(Number(intervalDraft) / 24).toFixed(1)} 天）</MiniLabel>
                 <input
                   type="number"
-                  min="0.25"
-                  step="0.5"
+                  min="6"
+                  step="6"
                   value={intervalDraft}
                   onChange={(e) => setIntervalDraft(e.target.value)}
-                  style={{ ...inputStyle, width: 120 }}
+                  style={{ ...inputStyle, width: 140 }}
                 />
               </div>
+              <GhostButton small onClick={() => setIntervalDraft(168)}>
+                每週一次
+              </GhostButton>
               {schedule.enabled ? (
                 <GhostButton onClick={() => saveSchedule(false)} small={false}>
                   {scheduleSaving ? "處理中…" : "停用自動排程"}
@@ -554,7 +557,7 @@ function ScreenTab({ candidates, importCandidates, clearCandidates, sortKey, sor
                 </GoldButton>
               )}
               <Badge tone={schedule.enabled ? "green" : "muted"}>
-                {schedule.enabled ? `每 ${schedule.interval_hours} 小時自動掃描` : "尚未啟用"}
+                {schedule.enabled ? `每 ${schedule.interval_hours} 小時（約${(schedule.interval_hours / 24).toFixed(1)}天）自動掃描` : "尚未啟用"}
               </Badge>
             </div>
           ) : (
