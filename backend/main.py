@@ -69,7 +69,7 @@ class ScreenRequest(BaseModel):
 
 class ScheduleConfig(BaseModel):
     enabled: bool = False
-    interval_hours: float = 24
+    interval_hours: float = 168   # 預設每週掃描一次
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +263,9 @@ def _apply_schedule(cfg: dict):
     if scheduler.get_job(SCHEDULE_JOB_ID):
         scheduler.remove_job(SCHEDULE_JOB_ID)
     if cfg.get("enabled"):
-        interval_hours = max(float(cfg.get("interval_hours", 24)), 0.25)  # 最短15分鐘，避免誤觸打爆API
+        # 全市場掃描要對 Yahoo Finance 發出數千次請求，下限設為6小時避免掃太頻繁把來源打爆
+        interval_hours = max(float(cfg.get("interval_hours", 168)), 6)
+        cfg["interval_hours"] = interval_hours
         job = scheduler.add_job(
             _run_full_market_scan_job,
             trigger=IntervalTrigger(hours=interval_hours),

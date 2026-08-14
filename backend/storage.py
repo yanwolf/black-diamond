@@ -24,7 +24,7 @@ DEFAULTS = {
     "holdings": [],
     "schedule": {
         "enabled": False,
-        "interval_hours": 24,
+        "interval_hours": 168,   # 預設每週掃描一次
         "last_run_at": None,
         "last_result_count": None,
         "next_run_at": None,
