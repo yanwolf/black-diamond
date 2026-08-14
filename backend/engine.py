@@ -123,6 +123,118 @@ def load_universe_csv(path: str) -> list:
 
 
 # ---------------------------------------------------------------------------
+# 型態分析（輔助人工判斷「低位盤整 ≥ 2年、剛突破起漲」，非取代人工判斷）
+# ---------------------------------------------------------------------------
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+
+def analyze_pattern(closes: list, weeks_per_year: int = 52, base_years: float = 2.0,
+                     exclude_recent_weeks: int = 12) -> dict:
+    """
+    輸入：closes = 由舊到新排列的收盤價（建議用週K，約需 base_years+3個月 的資料量）。
+
+    邏輯：
+      1. 排除最近 exclude_recent_weeks（約3個月）視為「起漲/觀察窗」。
+      2. 往前抓 base_years（預設2年）當作「盤整基期」。
+      3. 基期的價格區間越窄（(最高-最低)/最低）分數越高 → 代表盤整夠緊。
+      4. 基期頭尾價格變化越接近 0% 分數越高 → 代表是真的橫盤，不是緩漲。
+      5. 觀察窗的最高價要站上基期最高價，才算「確認突破」。
+      6. 突破幅度不能超過基期高點太多，太多代表已經噴出一段，不是「剛」突破。
+
+    這是輔助排序用的量化指標，仍需人工用「看線圖」功能肉眼複核，
+    無法判斷除權息調整是否正確、有無假突破、是否為剛IPO或有重大事件干擾等情況。
+    """
+    base_weeks = int(base_years * weeks_per_year)
+    needed = base_weeks + exclude_recent_weeks
+
+    if not closes or len(closes) < needed * 0.6:  # 資料量明顯不足（例如剛上市不久）
+        return {
+            "pattern_score": None,
+            "base_range_pct": None,
+            "base_trend_pct": None,
+            "breakout_confirmed": None,
+            "breakout_extension_pct": None,
+            "pattern_note": f"歷史資料不足（需要約 {base_years:.1f} 年以上），可能是近期新上市或資料不完整，無法自動分析型態",
+        }
+
+    # 資料量不到完整需求但還堪用時，依實際可用長度等比例縮小基期，仍嘗試分析
+    usable = closes[-min(len(closes), needed):]
+    if len(usable) <= exclude_recent_weeks + 4:
+        return {
+            "pattern_score": None,
+            "base_range_pct": None,
+            "base_trend_pct": None,
+            "breakout_confirmed": None,
+            "breakout_extension_pct": None,
+            "pattern_note": "資料量過短，無法區分基期與觀察窗",
+        }
+
+    recent = usable[-exclude_recent_weeks:]
+    base = usable[:-exclude_recent_weeks]
+
+    base_high = max(base)
+    base_low = min(base)
+    if base_low <= 0 or base_high <= 0:
+        return {
+            "pattern_score": None,
+            "base_range_pct": None,
+            "base_trend_pct": None,
+            "breakout_confirmed": None,
+            "breakout_extension_pct": None,
+            "pattern_note": "價格資料異常，無法分析",
+        }
+
+    base_range_pct = (base_high - base_low) / base_low * 100
+    base_trend_pct = (base[-1] - base[0]) / base[0] * 100
+
+    recent_high = max(recent)
+    breakout_confirmed = recent_high > base_high
+    breakout_extension_pct = (recent_high - base_high) / base_high * 100
+
+    # --- 四個子分數，各占25分 ---
+    # 1. 基期夠緊：範圍 <=40% 給滿分，>=150% 給0分
+    tightness_score = _clamp(25 * (1 - (base_range_pct - 40) / (150 - 40)), 0, 25)
+
+    # 2. 基期夠平：頭尾變化在0%附近給滿分，>=60%（不論漲跌）給0分
+    flatness_score = _clamp(25 * (1 - abs(base_trend_pct) / 60), 0, 25)
+
+    # 3. 是否確認突破基期高點
+    breakout_score = 25 if breakout_confirmed else 0
+
+    # 4. 突破幅度別噴太多：0%~15%給滿分，>=50%給0分（沒突破則此項為0）
+    if breakout_confirmed:
+        extension_score = _clamp(25 * (1 - max(0, breakout_extension_pct - 15) / (50 - 15)), 0, 25)
+    else:
+        extension_score = 0
+
+    # 突破分數要用「基期品質」打折：如果基期本來就不夠緊、不夠平（例如根本是持續緩漲，
+    # 不是真正的橫盤蓄積），就算價格創了新高，也不該被當成典型的黑鑽起漲型態。
+    base_component = tightness_score + flatness_score       # 0~50
+    base_quality_ratio = base_component / 50                # 0~1
+    breakout_component = breakout_score + extension_score   # 0~50
+
+    pattern_score = round(base_component + base_quality_ratio * breakout_component)
+    pattern_score = int(_clamp(pattern_score, 0, 100))
+
+    if pattern_score >= 70:
+        note = "型態符合度高：基期夠緊、夠平，且剛確認突破"
+    elif pattern_score >= 40:
+        note = "型態普通，建議搭配線圖肉眼複核"
+    else:
+        note = "型態偏弱（基期太寬鬆、走勢已偏離盤整、或尚未確認突破），建議謹慎看待"
+
+    return {
+        "pattern_score": pattern_score,
+        "base_range_pct": round(base_range_pct, 1),
+        "base_trend_pct": round(base_trend_pct, 1),
+        "breakout_confirmed": breakout_confirmed,
+        "breakout_extension_pct": round(breakout_extension_pct, 1),
+        "pattern_note": note,
+    }
+
+
+# ---------------------------------------------------------------------------
 # 單檔股票評估
 # ---------------------------------------------------------------------------
 def _to_float(val):

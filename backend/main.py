@@ -25,7 +25,7 @@ import yfinance as yf
 import pandas as pd
 
 import storage
-from engine import ScreenerConfig, run_screener, fetch_nasdaq_universe
+from engine import ScreenerConfig, run_screener, fetch_nasdaq_universe, analyze_pattern
 
 app = FastAPI(title="黑鑽選股系統 API")
 scheduler = BackgroundScheduler(timezone="UTC")
@@ -162,6 +162,7 @@ _job_lock = threading.Lock()
 _job_state = {
     "running": False,
     "mode": None,               # "symbols" | "nasdaq"
+    "phase": None,              # "screening" | "pattern"
     "processed": 0,
     "total": 0,
     "current_symbol": None,
@@ -175,6 +176,30 @@ _job_state = {
 
 def _now_iso():
     return datetime.now(timezone.utc).isoformat()
+
+
+def _annotate_pattern_scores(candidates: list):
+    """對已通過6道濾網的候選股，額外抓歷史週線計算型態分數（輔助排序，非取代人工判斷）。"""
+    total = len(candidates)
+    with _job_lock:
+        _job_state.update(phase="pattern", processed=0, total=total, current_symbol=None)
+    for i, c in enumerate(candidates, 1):
+        symbol = c.get("symbol")
+        with _job_lock:
+            _job_state.update(processed=i, current_symbol=symbol)
+        try:
+            payload = _get_history_payload(symbol, period="5y", interval="1wk")
+            closes = [p["close"] for p in payload["points"] if p.get("close") is not None]
+            c.update(analyze_pattern(closes))
+        except Exception as e:
+            c.update({
+                "pattern_score": None,
+                "base_range_pct": None,
+                "base_trend_pct": None,
+                "breakout_confirmed": None,
+                "breakout_extension_pct": None,
+                "pattern_note": f"型態分析失敗: {e}",
+            })
 
 
 def _run_job(symbols, cfg: ScreenerConfig, mode: str):
@@ -192,12 +217,22 @@ def _run_job(symbols, cfg: ScreenerConfig, mode: str):
                 # 週期性把快取存檔，若中途被中斷（例如服務重啟），下次重跑不用從頭全部重查
                 storage.save("symbol_cache", cache)
 
+        with _job_lock:
+            _job_state.update(phase="screening")
+
         result = run_screener(
             symbols, cfg, verbose=False, progress_callback=on_progress,
             cache=cache, freshness_hours=CACHE_FRESHNESS_HOURS,
         )
-        storage.save("candidates", result)
         storage.save("symbol_cache", cache)
+
+        # 篩選完成後，只對「通過6道濾網」的少數候選股額外算型態分數，不會對整個母體加重負擔
+        try:
+            _annotate_pattern_scores(result["candidates"])
+        except Exception:
+            pass  # 型態分析是輔助功能，就算整批失敗也不該讓篩選結果整個作廢
+
+        storage.save("candidates", result)
         with _job_lock:
             _job_state["error"] = None
         if mode == "nasdaq":
@@ -221,7 +256,7 @@ def _start_job(symbols, cfg: ScreenerConfig, mode: str) -> bool:
         if _job_state["running"]:
             return False
         _job_state.update(
-            running=True, mode=mode, processed=0, total=len(symbols), current_symbol=None,
+            running=True, mode=mode, phase="screening", processed=0, total=len(symbols), current_symbol=None,
             passed_so_far=0, cache_hits=0, fresh_fetches=0, error=None, finished_at=None,
         )
     thread = threading.Thread(target=_run_job, args=(symbols, cfg, mode), daemon=True)
@@ -352,15 +387,15 @@ def clear_cache():
 
 
 # ---------------------------------------------------------------------------
-# 個股歷史線圖（供人工判斷5年線型態用）
+# 個股歷史線圖（供人工判斷5年線型態、以及型態分數計算共用）
 # ---------------------------------------------------------------------------
 _chart_cache_lock = threading.Lock()
 _chart_cache = {}  # f"{symbol}:{period}:{interval}" -> (timestamp, payload)
-CHART_CACHE_TTL_SECONDS = 6 * 3600  # 同一檔股票6小時內重複開圖不用再打一次 yfinance
+CHART_CACHE_TTL_SECONDS = 6 * 3600  # 同一檔股票6小時內重複開圖/分析不用再打一次 yfinance
 
 
-@app.get("/api/chart/{symbol}")
-def get_chart(symbol: str, period: str = "5y", interval: str = "1wk"):
+def _get_history_payload(symbol: str, period: str = "5y", interval: str = "1wk") -> dict:
+    """核心邏輯：抓歷史股價（含快取）。失敗時丟出一般 Exception，由呼叫端決定如何處理。"""
     symbol = symbol.strip().upper()
     cache_key = f"{symbol}:{period}:{interval}"
 
@@ -369,14 +404,11 @@ def get_chart(symbol: str, period: str = "5y", interval: str = "1wk"):
         if cached and (time.time() - cached[0]) < CHART_CACHE_TTL_SECONDS:
             return cached[1]
 
-    try:
-        ticker = yf.Ticker(symbol)
-        hist = ticker.history(period=period, interval=interval)
-    except Exception as e:
-        raise HTTPException(502, f"取得 {symbol} 歷史股價失敗: {e}")
+    ticker = yf.Ticker(symbol)
+    hist = ticker.history(period=period, interval=interval)
 
     if hist is None or hist.empty:
-        raise HTTPException(404, f"查無 {symbol} 的歷史股價資料")
+        raise ValueError(f"查無 {symbol} 的歷史股價資料")
 
     def safe_float(v):
         return None if v is None or pd.isna(v) else round(float(v), 4)
@@ -396,6 +428,16 @@ def get_chart(symbol: str, period: str = "5y", interval: str = "1wk"):
     with _chart_cache_lock:
         _chart_cache[cache_key] = (time.time(), payload)
     return payload
+
+
+@app.get("/api/chart/{symbol}")
+def get_chart(symbol: str, period: str = "5y", interval: str = "1wk"):
+    try:
+        return _get_history_payload(symbol, period, interval)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        raise HTTPException(502, f"取得 {symbol} 歷史股價失敗: {e}")
 
 
 # ---------------------------------------------------------------------------
