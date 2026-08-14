@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo, useCallback } from "react";
+import ChartModal from "./ChartModal.jsx";
 
 /* ============================================================
    黑鑽選股儀表板 — Black Diamond Screener Dashboard
@@ -119,6 +120,12 @@ export default function App() {
       }
     })();
   }, []);
+
+  // 線圖 Modal：放在最上層，不管目前在哪個分頁都能開，且不受切分頁影響
+  const [chartTarget, setChartTarget] = useState(null); // { symbol, markers }
+  function openChart(symbol, markers = []) {
+    setChartTarget({ symbol, markers });
+  }
 
   // 輪詢中的工作進度；這個 effect 掛在 App 層級，不會因為切換分頁而被中斷
   useEffect(() => {
@@ -267,6 +274,7 @@ export default function App() {
                 jobError={jobError}
                 startSymbolScreen={startSymbolScreen}
                 startFullMarketScan={startFullMarketScan}
+                openChart={openChart}
               />
             )}
             {tab === "calc" && <CalcTab settings={settings} setSettings={saveSettings} />}
@@ -276,12 +284,20 @@ export default function App() {
                 addHolding={addHolding}
                 patchHolding={patchHolding}
                 removeHolding={removeHolding}
+                openChart={openChart}
               />
             )}
             {tab === "sop" && <SopTab />}
           </>
         )}
       </main>
+      {chartTarget && (
+        <ChartModal
+          symbol={chartTarget.symbol}
+          markers={chartTarget.markers}
+          onClose={() => setChartTarget(null)}
+        />
+      )}
     </div>
   );
 }
@@ -423,6 +439,7 @@ function ScreenTab({
   jobError,
   startSymbolScreen,
   startFullMarketScan,
+  openChart,
 }) {
   const [importText, setImportText] = useState("");
   const [importError, setImportError] = useState("");
@@ -722,7 +739,29 @@ function ScreenTab({
                 {candidates.map((c) => (
                   <tr key={c._id || c.symbol} style={{ borderBottom: "1px solid #1c1f27" }}>
                     <td style={cellStyle}>
-                      <div style={{ fontWeight: 700, color: "#F1E4C6" }}>{c.symbol}</div>
+                      <button
+                        onClick={() =>
+                          openChart(c.symbol, [
+                            { label: "現價", value: c.price, color: "#E8C275" },
+                            { label: "52週高", value: c.week52_high, color: "#E5484D" },
+                            { label: "52週低", value: c.week52_low, color: "#2FA36B" },
+                          ])
+                        }
+                        style={{
+                          background: "none",
+                          border: "none",
+                          padding: 0,
+                          cursor: "pointer",
+                          textAlign: "left",
+                          fontWeight: 700,
+                          color: "#F1E4C6",
+                          textDecoration: "underline",
+                          textDecorationColor: "#3a3e4a",
+                          textUnderlineOffset: 3,
+                        }}
+                      >
+                        {c.symbol}
+                      </button>
                       {c.name && <div style={{ fontSize: 11, color: "#6B7080" }}>{c.name}</div>}
                       {c.needs_manual_review && (
                         <div style={{ fontSize: 11, color: "#E5484D", marginTop: 2 }}>
@@ -741,9 +780,23 @@ function ScreenTab({
                     <td style={{ ...cellStyle, fontFamily: "'JetBrains Mono', monospace" }}>{fmt.money(c.avg_volume)}</td>
                     <td style={cellStyle}>{c.exchange || "—"}</td>
                     <td style={cellStyle}>
-                      <GhostButton small onClick={() => addToHoldings(c)}>
-                        加入追蹤
-                      </GhostButton>
+                      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                        <GhostButton
+                          small
+                          onClick={() =>
+                            openChart(c.symbol, [
+                              { label: "現價", value: c.price, color: "#E8C275" },
+                              { label: "52週高", value: c.week52_high, color: "#E5484D" },
+                              { label: "52週低", value: c.week52_low, color: "#2FA36B" },
+                            ])
+                          }
+                        >
+                          看線圖
+                        </GhostButton>
+                        <GhostButton small onClick={() => addToHoldings(c)}>
+                          加入追蹤
+                        </GhostButton>
+                      </div>
                     </td>
                   </tr>
                 ))}
@@ -879,7 +932,7 @@ const STAGE_LABELS = {
   closed: { label: "已出場", tone: "muted" },
 };
 
-function HoldingsTab({ holdings, addHolding, patchHolding, removeHolding }) {
+function HoldingsTab({ holdings, addHolding, patchHolding, removeHolding, openChart }) {
   function addBlank() {
     addHolding({
       symbol: "",
@@ -906,6 +959,7 @@ function HoldingsTab({ holdings, addHolding, patchHolding, removeHolding }) {
                 holding={h}
                 onChange={(patch) => patchHolding(h._id, patch)}
                 onRemove={() => removeHolding(h._id)}
+                openChart={openChart}
               />
             ))}
           </div>
@@ -930,7 +984,7 @@ function HoldingsTab({ holdings, addHolding, patchHolding, removeHolding }) {
   );
 }
 
-function HoldingCard({ holding, onChange, onRemove }) {
+function HoldingCard({ holding, onChange, onRemove, openChart }) {
   const stage = STAGE_LABELS[holding.stage] || STAGE_LABELS.watching;
   return (
     <div
@@ -1013,6 +1067,19 @@ function HoldingCard({ holding, onChange, onRemove }) {
         />
       </div>
       <Badge tone={stage.tone}>{stage.label}</Badge>
+      {holding.symbol && (
+        <GhostButton
+          small
+          onClick={() =>
+            openChart(holding.symbol, [
+              { label: "進場價", value: holding.entryPrice, color: "#E8C275" },
+              { label: "停損價", value: holding.stopPrice, color: "#E5484D" },
+            ])
+          }
+        >
+          看線圖
+        </GhostButton>
+      )}
       <button
         onClick={onRemove}
         style={{
