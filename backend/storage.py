@@ -22,6 +22,13 @@ DEFAULTS = {
     "settings": {"totalCapital": 500000, "riskPct": 1},
     "candidates": {"generated_at": None, "candidates": []},
     "holdings": [],
+    "schedule": {
+        "enabled": False,
+        "interval_hours": 24,
+        "last_run_at": None,
+        "last_result_count": None,
+        "next_run_at": None,
+    },
 }
 
 

@@ -11,6 +11,7 @@ import os
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from typing import Optional, List
 
 from fastapi import FastAPI, HTTPException, Body
@@ -18,11 +19,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 
 import storage
 from engine import ScreenerConfig, run_screener, fetch_nasdaq_universe
 
 app = FastAPI(title="黑鑽選股系統 API")
+scheduler = BackgroundScheduler(timezone="UTC")
+SCHEDULE_JOB_ID = "full_market_scan"
 
 # 若前端與後端分開部署（不同網域），需要開放 CORS；同源部署則此設定無害。
 app.add_middleware(
@@ -60,6 +65,11 @@ class ScreenRequest(BaseModel):
     ps_max: float = ScreenerConfig.ps_ratio_max
     range_min: float = ScreenerConfig.range_position_min
     volume_min: float = ScreenerConfig.avg_volume_min
+
+
+class ScheduleConfig(BaseModel):
+    enabled: bool = False
+    interval_hours: float = 24
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +156,7 @@ def delete_holding(holding_id: str):
 _job_lock = threading.Lock()
 _job_state = {
     "running": False,
+    "mode": None,               # "symbols" | "nasdaq"
     "processed": 0,
     "total": 0,
     "current_symbol": None,
@@ -155,7 +166,11 @@ _job_state = {
 }
 
 
-def _run_job(symbols, cfg: ScreenerConfig):
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _run_job(symbols, cfg: ScreenerConfig, mode: str):
     global _job_state
     try:
         def on_progress(i, total, symbol, passed_so_far):
@@ -168,6 +183,11 @@ def _run_job(symbols, cfg: ScreenerConfig):
         storage.save("candidates", result)
         with _job_lock:
             _job_state["error"] = None
+        if mode == "nasdaq":
+            sched = storage.load("schedule")
+            sched["last_run_at"] = _now_iso()
+            sched["last_result_count"] = result.get("candidate_count")
+            storage.save("schedule", sched)
     except Exception as e:
         with _job_lock:
             _job_state["error"] = str(e)
@@ -177,16 +197,28 @@ def _run_job(symbols, cfg: ScreenerConfig):
             _job_state["finished_at"] = time.time()
 
 
-@app.post("/api/screen/run")
-def start_screen(req: ScreenRequest):
+def _start_job(symbols, cfg: ScreenerConfig, mode: str) -> bool:
+    """回傳 True 表示成功啟動，False 表示已有工作在跑而略過。"""
     with _job_lock:
         if _job_state["running"]:
-            raise HTTPException(409, "已有篩選工作正在執行中，請稍候")
+            return False
+        _job_state.update(
+            running=True, mode=mode, processed=0, total=len(symbols), current_symbol=None,
+            passed_so_far=0, error=None, finished_at=None,
+        )
+    thread = threading.Thread(target=_run_job, args=(symbols, cfg, mode), daemon=True)
+    thread.start()
+    return True
 
+
+@app.post("/api/screen/run")
+def start_screen(req: ScreenRequest):
     if req.source == "nasdaq":
         symbols = fetch_nasdaq_universe()
+        mode = "nasdaq"
     elif req.symbols:
         symbols = [s.strip().upper() for s in req.symbols if s.strip()]
+        mode = "symbols"
     else:
         raise HTTPException(400, "請提供 symbols，或將 source 設為 'nasdaq'")
 
@@ -198,14 +230,9 @@ def start_screen(req: ScreenRequest):
         avg_volume_min=req.volume_min,
     )
 
-    with _job_lock:
-        _job_state.update(
-            running=True, processed=0, total=len(symbols), current_symbol=None,
-            passed_so_far=0, error=None, finished_at=None,
-        )
-
-    thread = threading.Thread(target=_run_job, args=(symbols, cfg), daemon=True)
-    thread.start()
+    started = _start_job(symbols, cfg, mode)
+    if not started:
+        raise HTTPException(409, "已有篩選工作正在執行中，請稍候")
     return {"started": True, "universe_size": len(symbols)}
 
 
@@ -213,6 +240,80 @@ def start_screen(req: ScreenRequest):
 def screen_status():
     with _job_lock:
         return dict(_job_state)
+
+
+# ---------------------------------------------------------------------------
+# 全市場掃描 + 排程
+# ---------------------------------------------------------------------------
+def _run_full_market_scan_job():
+    """供手動按鈕與排程器共用的進入點。用預設濾網參數跑全市場（NASDAQ+NYSE）。"""
+    try:
+        symbols = fetch_nasdaq_universe()
+    except Exception as e:
+        with _job_lock:
+            _job_state["error"] = f"抓取上市清單失敗: {e}"
+        return
+    started = _start_job(symbols, ScreenerConfig(), "nasdaq")
+    if not started:
+        print("[scheduler] 略過本次排程：已有篩選工作正在執行中")
+
+
+def _apply_schedule(cfg: dict):
+    """依 schedule 設定重新註冊/移除 APScheduler 的定期任務。"""
+    if scheduler.get_job(SCHEDULE_JOB_ID):
+        scheduler.remove_job(SCHEDULE_JOB_ID)
+    if cfg.get("enabled"):
+        interval_hours = max(float(cfg.get("interval_hours", 24)), 0.25)  # 最短15分鐘，避免誤觸打爆API
+        job = scheduler.add_job(
+            _run_full_market_scan_job,
+            trigger=IntervalTrigger(hours=interval_hours),
+            id=SCHEDULE_JOB_ID,
+            replace_existing=True,
+        )
+        cfg["next_run_at"] = job.next_run_time.isoformat() if job.next_run_time else None
+    else:
+        cfg["next_run_at"] = None
+    storage.save("schedule", cfg)
+    return cfg
+
+
+@app.on_event("startup")
+def on_startup():
+    scheduler.start()
+    cfg = storage.load("schedule")
+    if cfg.get("enabled"):
+        _apply_schedule(cfg)
+
+
+@app.on_event("shutdown")
+def on_shutdown():
+    scheduler.shutdown(wait=False)
+
+
+@app.post("/api/scan/full-market/run")
+def run_full_market_scan_now():
+    try:
+        symbols = fetch_nasdaq_universe()
+    except Exception as e:
+        raise HTTPException(502, f"抓取 NASDAQ/NYSE 上市清單失敗: {e}")
+    started = _start_job(symbols, ScreenerConfig(), "nasdaq")
+    if not started:
+        raise HTTPException(409, "已有篩選工作正在執行中，請稍候")
+    return {"started": True, "universe_size": len(symbols)}
+
+
+@app.get("/api/scan/schedule")
+def get_schedule():
+    return storage.load("schedule")
+
+
+@app.put("/api/scan/schedule")
+def put_schedule(cfg: ScheduleConfig):
+    saved = _apply_schedule(cfg.dict() | {
+        "last_run_at": storage.load("schedule").get("last_run_at"),
+        "last_result_count": storage.load("schedule").get("last_result_count"),
+    })
+    return saved
 
 
 # ---------------------------------------------------------------------------
