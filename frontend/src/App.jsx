@@ -78,15 +78,22 @@ export default function App() {
   const [sortKey, setSortKey] = useState("range_position_pct");
   const [sortDir, setSortDir] = useState("desc");
 
+  // 篩選工作狀態放在最上層，切換分頁或重新整理頁面都不會遺失，
+  // 因為實際的工作是在伺服器背景執行緒跑的，前端只是輪詢進度。
+  const [jobStatus, setJobStatus] = useState(null);
+  const [polling, setPolling] = useState(false);
+  const [jobError, setJobError] = useState("");
+
+  const refreshCandidates = useCallback(async () => {
+    const c = await apiGet("/candidates");
+    setCandidates((c.candidates || []).map((x, i) => ({ ...x, _id: x._id || `${x.symbol}-${i}` })));
+    return c;
+  }, []);
+
   const refreshAll = useCallback(async () => {
     try {
-      const [s, c, h] = await Promise.all([
-        apiGet("/settings"),
-        apiGet("/candidates"),
-        apiGet("/holdings"),
-      ]);
+      const [s, , h] = await Promise.all([apiGet("/settings"), refreshCandidates(), apiGet("/holdings")]);
       setSettings(s);
-      setCandidates((c.candidates || []).map((x, i) => ({ ...x, _id: x._id || `${x.symbol}-${i}` })));
       setHoldings(h || []);
       setLoadError("");
     } catch (e) {
@@ -94,11 +101,59 @@ export default function App() {
     } finally {
       setLoaded(true);
     }
-  }, []);
+  }, [refreshCandidates]);
 
   useEffect(() => {
     refreshAll();
   }, [refreshAll]);
+
+  // 頁面載入時檢查伺服器是否有正在執行的篩選工作（例如剛好重新整理頁面時掃描還在跑）
+  useEffect(() => {
+    (async () => {
+      try {
+        const status = await apiGet("/screen/status");
+        setJobStatus(status);
+        if (status.running) setPolling(true);
+      } catch {
+        /* 忽略，refreshAll 已經會回報連線錯誤 */
+      }
+    })();
+  }, []);
+
+  // 輪詢中的工作進度；這個 effect 掛在 App 層級，不會因為切換分頁而被中斷
+  useEffect(() => {
+    if (!polling) return;
+    const timer = setInterval(async () => {
+      try {
+        const status = await apiGet("/screen/status");
+        setJobStatus(status);
+        if (!status.running) {
+          setPolling(false);
+          if (!status.error) {
+            await refreshCandidates();
+          } else {
+            setJobError(status.error);
+          }
+        }
+      } catch (e) {
+        setJobError(e.message);
+        setPolling(false);
+      }
+    }, 1500);
+    return () => clearInterval(timer);
+  }, [polling, refreshCandidates]);
+
+  async function startSymbolScreen(symbols) {
+    setJobError("");
+    await apiSend("POST", "/screen/run", { source: "symbols", symbols });
+    setPolling(true);
+  }
+
+  async function startFullMarketScan() {
+    setJobError("");
+    await apiSend("POST", "/scan/full-market/run");
+    setPolling(true);
+  }
 
   async function saveSettings(next) {
     setSettings(next);
@@ -207,6 +262,11 @@ export default function App() {
                 sortDir={sortDir}
                 toggleSort={toggleSort}
                 addToHoldings={addCandidateToHoldings}
+                jobStatus={jobStatus}
+                polling={polling}
+                jobError={jobError}
+                startSymbolScreen={startSymbolScreen}
+                startFullMarketScan={startFullMarketScan}
               />
             )}
             {tab === "calc" && <CalcTab settings={settings} setSettings={saveSettings} />}
@@ -350,19 +410,33 @@ function Panel({ children, style = {}, title, eyebrow }) {
 /* ============================================================
    Tab 1: 選股清單
    ============================================================ */
-function ScreenTab({ candidates, importCandidates, clearCandidates, sortKey, sortDir, toggleSort, addToHoldings }) {
+function ScreenTab({
+  candidates,
+  importCandidates,
+  clearCandidates,
+  sortKey,
+  sortDir,
+  toggleSort,
+  addToHoldings,
+  jobStatus,
+  polling,
+  jobError,
+  startSymbolScreen,
+  startFullMarketScan,
+}) {
   const [importText, setImportText] = useState("");
   const [importError, setImportError] = useState("");
+  const [runError, setRunError] = useState("");
 
   const [symbolsInput, setSymbolsInput] = useState("");
-  const [jobStatus, setJobStatus] = useState(null);
-  const [jobError, setJobError] = useState("");
-  const [polling, setPolling] = useState(false);
 
   const [schedule, setSchedule] = useState(null);
   const [scheduleError, setScheduleError] = useState("");
   const [scheduleSaving, setScheduleSaving] = useState(false);
   const [intervalDraft, setIntervalDraft] = useState(168);
+
+  const [cacheStats, setCacheStats] = useState(null);
+  const [cacheBusy, setCacheBusy] = useState(false);
 
   const loadSchedule = useCallback(async () => {
     try {
@@ -374,17 +448,45 @@ function ScreenTab({ candidates, importCandidates, clearCandidates, sortKey, sor
     }
   }, []);
 
+  const loadCacheStats = useCallback(async () => {
+    try {
+      setCacheStats(await apiGet("/cache/stats"));
+    } catch {
+      /* 非關鍵資訊，安靜失敗即可 */
+    }
+  }, []);
+
   useEffect(() => {
     loadSchedule();
-  }, [loadSchedule]);
+    loadCacheStats();
+  }, [loadSchedule, loadCacheStats]);
+
+  // 工作完成時（無論在哪個分頁被觸發、之後可能又切回這頁）順便刷新排程與快取統計
+  useEffect(() => {
+    if (!polling && jobStatus && !jobStatus.running) {
+      loadSchedule();
+      loadCacheStats();
+    }
+  }, [polling, jobStatus, loadSchedule, loadCacheStats]);
 
   async function handleFullMarketScan() {
-    setJobError("");
+    setRunError("");
     try {
-      await apiSend("POST", "/scan/full-market/run");
-      setPolling(true);
+      await startFullMarketScan();
     } catch (e) {
-      setJobError(e.message);
+      setRunError(e.message);
+    }
+  }
+
+  async function handleClearCache() {
+    setCacheBusy(true);
+    try {
+      await apiSend("DELETE", "/cache");
+      await loadCacheStats();
+    } catch (e) {
+      setScheduleError(e.message);
+    } finally {
+      setCacheBusy(false);
     }
   }
 
@@ -426,46 +528,21 @@ function ScreenTab({ candidates, importCandidates, clearCandidates, sortKey, sor
   }
 
   async function handleRunScreen() {
-    setJobError("");
+    setRunError("");
     const symbols = symbolsInput
       .split(/[,\s]+/)
       .map((s) => s.trim())
       .filter(Boolean);
     if (symbols.length === 0) {
-      setJobError("請輸入至少一檔股票代碼");
+      setRunError("請輸入至少一檔股票代碼");
       return;
     }
     try {
-      await apiSend("POST", "/screen/run", { source: "symbols", symbols });
-      setPolling(true);
+      await startSymbolScreen(symbols);
     } catch (e) {
-      setJobError(e.message);
+      setRunError(e.message);
     }
   }
-
-  useEffect(() => {
-    if (!polling) return;
-    const timer = setInterval(async () => {
-      try {
-        const status = await apiGet("/screen/status");
-        setJobStatus(status);
-        if (!status.running) {
-          setPolling(false);
-          if (!status.error) {
-            const data = await apiGet("/candidates");
-            await importCandidates(data);
-            if (status.mode === "nasdaq") loadSchedule();
-          } else {
-            setJobError(status.error);
-          }
-        }
-      } catch (e) {
-        setJobError(e.message);
-        setPolling(false);
-      }
-    }, 1500);
-    return () => clearInterval(timer);
-  }, [polling, importCandidates, loadSchedule]);
 
   function fmtDateTime(iso) {
     if (!iso) return "—";
@@ -481,7 +558,6 @@ function ScreenTab({ candidates, importCandidates, clearCandidates, sortKey, sor
       <Panel eyebrow="STEP 01 · 執行篩選" title="從後端跑一次篩選">
         <p style={{ color: "#8B90A0", fontSize: 13, lineHeight: 1.7, marginTop: 0 }}>
           輸入想篩選的股票代碼（空白或逗號分隔），後端會即時用 6 道濾網逐檔檢查。
-          若要對整個美股市場篩選，建議改用 <code style={{ color: "#C9A15A" }}>engine.py --fetch-nasdaq</code> 在本機或排程執行，較不受網頁逾時限制。
         </p>
         <textarea
           value={symbolsInput}
@@ -500,33 +576,42 @@ function ScreenTab({ candidates, importCandidates, clearCandidates, sortKey, sor
             resize: "vertical",
           }}
         />
-        {jobError && <div style={{ color: "#E5484D", fontSize: 13, marginTop: 8 }}>{jobError}</div>}
+        {(runError || (jobError && !polling)) && (
+          <div style={{ color: "#E5484D", fontSize: 13, marginTop: 8 }}>{runError || jobError}</div>
+        )}
         <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 12 }}>
           <GoldButton onClick={handleRunScreen} disabled={polling}>
-            {polling ? "篩選中…" : "開始篩選"}
+            {polling && jobStatus?.mode === "symbols" ? "篩選中…" : "開始篩選"}
           </GoldButton>
-          {jobStatus && polling && (
-            <span style={{ fontSize: 12, color: "#8B90A0", fontFamily: "'JetBrains Mono', monospace" }}>
-              {jobStatus.processed}/{jobStatus.total} · 目前：{jobStatus.current_symbol || "—"} · 已通過 {jobStatus.passed_so_far} 檔
-            </span>
-          )}
+          {polling && jobStatus?.mode === "symbols" && <JobProgress status={jobStatus} />}
         </div>
       </Panel>
 
       <Panel eyebrow="全市場掃描" title="對整個 NASDAQ + NYSE 掃描一次">
         <p style={{ color: "#8B90A0", fontSize: 13, lineHeight: 1.7, marginTop: 0 }}>
           在伺服器上跑一次完整市場掃描（數千檔股票，套用預設的6道濾網參數），完成後結果會自動出現在下方候選清單。
-          因為要對 Yahoo Finance 發出大量請求，這個過程可能需要一段時間，過程中可以離開頁面，之後回來看結果即可。
+          這是背景工作：<strong style={{ color: "#E8C275" }}>切換分頁或重新整理頁面都不會中斷</strong>，
+          回到這頁會自動接回目前進度。
         </p>
         <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
           <GoldButton onClick={handleFullMarketScan} disabled={polling}>
             {polling && jobStatus?.mode === "nasdaq" ? "全市場掃描中…" : "開始全市場掃描"}
           </GoldButton>
-          {polling && jobStatus?.mode === "nasdaq" && (
-            <span style={{ fontSize: 12, color: "#8B90A0", fontFamily: "'JetBrains Mono', monospace" }}>
-              {jobStatus.processed}/{jobStatus.total} · 目前：{jobStatus.current_symbol || "—"} · 已通過 {jobStatus.passed_so_far} 檔
-            </span>
-          )}
+          {polling && jobStatus?.mode === "nasdaq" && <JobProgress status={jobStatus} />}
+        </div>
+        {runError && <div style={{ color: "#E5484D", fontSize: 13, marginTop: 8 }}>{runError}</div>}
+
+        <div style={{ marginTop: 20, paddingTop: 20, borderTop: "1px solid #23262f" }}>
+          <MiniLabel>個股快取</MiniLabel>
+          <p style={{ color: "#8B90A0", fontSize: 13, lineHeight: 1.7, margin: "4px 0 10px" }}>
+            近 {cacheStats?.freshness_hours ?? 24} 小時內已檢查過的股票會直接沿用快取結果，不重新查詢，加速重跑或接續中斷的掃描。
+          </p>
+          <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
+            <Badge tone="muted">已快取 {cacheStats ? cacheStats.cached_symbols : "—"} 檔</Badge>
+            <GhostButton small onClick={handleClearCache}>
+              {cacheBusy ? "清除中…" : "清除快取"}
+            </GhostButton>
+          </div>
         </div>
 
         <div style={{ marginTop: 20, paddingTop: 20, borderTop: "1px solid #23262f" }}>
@@ -683,6 +768,18 @@ function ScreenTab({ candidates, importCandidates, clearCandidates, sortKey, sor
 }
 
 const cellStyle = { padding: "10px", verticalAlign: "top" };
+
+function JobProgress({ status }) {
+  if (!status) return null;
+  return (
+    <span style={{ fontSize: 12, color: "#8B90A0", fontFamily: "'JetBrains Mono', monospace" }}>
+      {status.processed}/{status.total} · 目前：{status.current_symbol || "—"} · 已通過 {status.passed_so_far} 檔
+      {(status.cache_hits > 0 || status.fresh_fetches > 0) && (
+        <> · 快取 {status.cache_hits} / 新查 {status.fresh_fetches}</>
+      )}
+    </span>
+  );
+}
 
 /* ============================================================
    Tab 2: 停損停利計算機
