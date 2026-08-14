@@ -359,6 +359,51 @@ function ScreenTab({ candidates, importCandidates, clearCandidates, sortKey, sor
   const [jobError, setJobError] = useState("");
   const [polling, setPolling] = useState(false);
 
+  const [schedule, setSchedule] = useState(null);
+  const [scheduleError, setScheduleError] = useState("");
+  const [scheduleSaving, setScheduleSaving] = useState(false);
+  const [intervalDraft, setIntervalDraft] = useState(24);
+
+  const loadSchedule = useCallback(async () => {
+    try {
+      const s = await apiGet("/scan/schedule");
+      setSchedule(s);
+      setIntervalDraft(s.interval_hours);
+    } catch (e) {
+      setScheduleError(e.message);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadSchedule();
+  }, [loadSchedule]);
+
+  async function handleFullMarketScan() {
+    setJobError("");
+    try {
+      await apiSend("POST", "/scan/full-market/run");
+      setPolling(true);
+    } catch (e) {
+      setJobError(e.message);
+    }
+  }
+
+  async function saveSchedule(enabled) {
+    setScheduleSaving(true);
+    setScheduleError("");
+    try {
+      const s = await apiSend("PUT", "/scan/schedule", {
+        enabled,
+        interval_hours: Number(intervalDraft) || 24,
+      });
+      setSchedule(s);
+    } catch (e) {
+      setScheduleError(e.message);
+    } finally {
+      setScheduleSaving(false);
+    }
+  }
+
   const cols = [
     { key: "symbol", label: "代碼" },
     { key: "market_cap", label: "市值" },
@@ -409,6 +454,7 @@ function ScreenTab({ candidates, importCandidates, clearCandidates, sortKey, sor
           if (!status.error) {
             const data = await apiGet("/candidates");
             await importCandidates(data);
+            if (status.mode === "nasdaq") loadSchedule();
           } else {
             setJobError(status.error);
           }
@@ -419,7 +465,16 @@ function ScreenTab({ candidates, importCandidates, clearCandidates, sortKey, sor
       }
     }, 1500);
     return () => clearInterval(timer);
-  }, [polling, importCandidates]);
+  }, [polling, importCandidates, loadSchedule]);
+
+  function fmtDateTime(iso) {
+    if (!iso) return "—";
+    try {
+      return new Date(iso).toLocaleString("zh-TW", { hour12: false });
+    } catch {
+      return iso;
+    }
+  }
 
   return (
     <div>
@@ -455,6 +510,68 @@ function ScreenTab({ candidates, importCandidates, clearCandidates, sortKey, sor
               {jobStatus.processed}/{jobStatus.total} · 目前：{jobStatus.current_symbol || "—"} · 已通過 {jobStatus.passed_so_far} 檔
             </span>
           )}
+        </div>
+      </Panel>
+
+      <Panel eyebrow="全市場掃描" title="對整個 NASDAQ + NYSE 掃描一次">
+        <p style={{ color: "#8B90A0", fontSize: 13, lineHeight: 1.7, marginTop: 0 }}>
+          在伺服器上跑一次完整市場掃描（數千檔股票，套用預設的6道濾網參數），完成後結果會自動出現在下方候選清單。
+          因為要對 Yahoo Finance 發出大量請求，這個過程可能需要一段時間，過程中可以離開頁面，之後回來看結果即可。
+        </p>
+        <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+          <GoldButton onClick={handleFullMarketScan} disabled={polling}>
+            {polling && jobStatus?.mode === "nasdaq" ? "全市場掃描中…" : "開始全市場掃描"}
+          </GoldButton>
+          {polling && jobStatus?.mode === "nasdaq" && (
+            <span style={{ fontSize: 12, color: "#8B90A0", fontFamily: "'JetBrains Mono', monospace" }}>
+              {jobStatus.processed}/{jobStatus.total} · 目前：{jobStatus.current_symbol || "—"} · 已通過 {jobStatus.passed_so_far} 檔
+            </span>
+          )}
+        </div>
+
+        <div style={{ marginTop: 20, paddingTop: 20, borderTop: "1px solid #23262f" }}>
+          <MiniLabel>自動排程</MiniLabel>
+          {schedule ? (
+            <div style={{ display: "flex", alignItems: "flex-end", gap: 16, flexWrap: "wrap", marginTop: 6 }}>
+              <div>
+                <MiniLabel>每隔幾小時掃描一次</MiniLabel>
+                <input
+                  type="number"
+                  min="0.25"
+                  step="0.5"
+                  value={intervalDraft}
+                  onChange={(e) => setIntervalDraft(e.target.value)}
+                  style={{ ...inputStyle, width: 120 }}
+                />
+              </div>
+              {schedule.enabled ? (
+                <GhostButton onClick={() => saveSchedule(false)} small={false}>
+                  {scheduleSaving ? "處理中…" : "停用自動排程"}
+                </GhostButton>
+              ) : (
+                <GoldButton onClick={() => saveSchedule(true)}>
+                  {scheduleSaving ? "處理中…" : "啟用自動排程"}
+                </GoldButton>
+              )}
+              <Badge tone={schedule.enabled ? "green" : "muted"}>
+                {schedule.enabled ? `每 ${schedule.interval_hours} 小時自動掃描` : "尚未啟用"}
+              </Badge>
+            </div>
+          ) : (
+            <div style={{ color: "#5c6070", fontSize: 12, marginTop: 6 }}>載入排程設定中…</div>
+          )}
+
+          {schedule && (
+            <div style={{ display: "flex", gap: 24, marginTop: 14, fontSize: 12, color: "#8B90A0", flexWrap: "wrap" }}>
+              <span>上次掃描：{fmtDateTime(schedule.last_run_at)}{schedule.last_result_count !== null && schedule.last_result_count !== undefined ? `（${schedule.last_result_count} 檔通過）` : ""}</span>
+              <span>下次排程掃描：{schedule.enabled ? fmtDateTime(schedule.next_run_at) : "—"}</span>
+            </div>
+          )}
+          {scheduleError && <div style={{ color: "#E5484D", fontSize: 13, marginTop: 8 }}>{scheduleError}</div>}
+          <div style={{ color: "#5c6070", fontSize: 11, marginTop: 10, lineHeight: 1.6 }}>
+            ⚠ 排程只在伺服器程序持續運行時有效；若服務重啟，排程會依照儲存的設定自動重新註冊，
+            但若當下距離下次應執行時間已過，會等到下一個整週期才觸發。
+          </div>
         </div>
       </Panel>
 
