@@ -76,7 +76,7 @@ export default function App() {
   const [settings, setSettings] = useState({ totalCapital: 500000, riskPct: 1 });
   const [candidates, setCandidates] = useState([]);
   const [holdings, setHoldings] = useState([]);
-  const [sortKey, setSortKey] = useState("range_position_pct");
+  const [sortKey, setSortKey] = useState("pattern_score");
   const [sortDir, setSortDir] = useState("desc");
 
   // 篩選工作狀態放在最上層，切換分頁或重新整理頁面都不會遺失，
@@ -525,6 +525,7 @@ function ScreenTab({
 
   const cols = [
     { key: "symbol", label: "代碼" },
+    { key: "pattern_score", label: "型態分數" },
     { key: "market_cap", label: "市值" },
     { key: "price", label: "股價" },
     { key: "price_to_sales", label: "P/S" },
@@ -769,6 +770,9 @@ function ScreenTab({
                         </div>
                       )}
                     </td>
+                    <td style={cellStyle}>
+                      <PatternScoreBadge score={c.pattern_score} note={c.pattern_note} />
+                    </td>
                     <td style={{ ...cellStyle, fontFamily: "'JetBrains Mono', monospace" }}>{fmt.money(c.market_cap)}</td>
                     <td style={{ ...cellStyle, fontFamily: "'JetBrains Mono', monospace" }}>${fmt.price(c.price)}</td>
                     <td style={{ ...cellStyle, fontFamily: "'JetBrains Mono', monospace" }}>
@@ -807,10 +811,15 @@ function ScreenTab({
       </Panel>
 
       <Panel eyebrow="STEP 03 · 型態判斷" title="人工複核提醒">
+        <p style={{ color: "#8B90A0", fontSize: 13, lineHeight: 1.7, marginTop: 0 }}>
+          候選股清單裡的「型態分數」是電腦根據近2年價格區間夠不夠緊、夠不夠平、有沒有確認突破
+          自動算出來的輔助排序分數（滿分100），<strong style={{ color: "#E8C275" }}>用來決定優先看誰，不是拿來取代肉眼判斷</strong>。
+          除權息調整、假突破、剛IPO資料不足、有無重大事件干擾，電腦都判斷不出來。
+        </p>
         <ChecklistStatic
           items={[
-            "打開 5 年線圖，確認低位盤整時間 ≥ 2 年",
-            "確認最近剛突破盤整區間（起漲狀態）",
+            "優先看「型態分數」高的幾檔，點「看線圖」打開5年走勢圖肉眼複核",
+            "確認低位盤整時間 ≥ 2 年、最近剛突破盤整區間（起漲狀態）",
             "排除 AMEX 交易所的股票",
             "從候選清單中，最終可能只留下 1～2 檔適合進場",
           ]}
@@ -824,12 +833,49 @@ const cellStyle = { padding: "10px", verticalAlign: "top" };
 
 function JobProgress({ status }) {
   if (!status) return null;
+  const phaseLabel = status.phase === "pattern" ? "分析型態中" : "篩選中";
   return (
     <span style={{ fontSize: 12, color: "#8B90A0", fontFamily: "'JetBrains Mono', monospace" }}>
-      {status.processed}/{status.total} · 目前：{status.current_symbol || "—"} · 已通過 {status.passed_so_far} 檔
-      {(status.cache_hits > 0 || status.fresh_fetches > 0) && (
+      {phaseLabel} {status.processed}/{status.total}
+      {status.phase !== "pattern" && <> · 目前：{status.current_symbol || "—"} · 已通過 {status.passed_so_far} 檔</>}
+      {status.phase === "pattern" && <> · 目前：{status.current_symbol || "—"}</>}
+      {(status.cache_hits > 0 || status.fresh_fetches > 0) && status.phase !== "pattern" && (
         <> · 快取 {status.cache_hits} / 新查 {status.fresh_fetches}</>
       )}
+    </span>
+  );
+}
+
+function PatternScoreBadge({ score, note }) {
+  if (score === null || score === undefined) {
+    return (
+      <span style={{ fontSize: 12, color: "#5c6070" }} title={note || "尚未分析"}>
+        —
+      </span>
+    );
+  }
+  const tone = score >= 70 ? "green" : score >= 40 ? "gold" : "red";
+  const colors = {
+    green: { bg: "rgba(47,163,107,0.15)", fg: "#4CC98A" },
+    gold: { bg: "rgba(201,161,90,0.15)", fg: "#E8C275" },
+    red: { bg: "rgba(229,72,77,0.15)", fg: "#F0787C" },
+  };
+  const c = colors[tone];
+  return (
+    <span
+      title={note || ""}
+      style={{
+        display: "inline-block",
+        background: c.bg,
+        color: c.fg,
+        fontFamily: "'JetBrains Mono', monospace",
+        fontWeight: 700,
+        fontSize: 13,
+        padding: "4px 9px",
+        cursor: note ? "help" : "default",
+      }}
+    >
+      {score}
     </span>
   );
 }
@@ -1152,13 +1198,31 @@ function SopTab() {
         </div>
       </Panel>
 
+      <Panel eyebrow="輔助判斷" title="型態分數是怎麼算的">
+        <p style={{ color: "#8B90A0", fontSize: 13, lineHeight: 1.7, marginTop: 0 }}>
+          候選股通過6道濾網後，系統會額外抓近5年週K，計算「型態分數」（0~100）：
+        </p>
+        <SopTable
+          rows={[
+            ["基期夠緊", "近2年（排除近3個月）價格區間 (最高-最低)/最低 越小分數越高"],
+            ["基期夠平", "同一段期間頭尾價格變化越接近 0% 分數越高，避免把緩漲誤判成盤整"],
+            ["確認突破", "最近3個月的高點要真的站上基期高點，才算數"],
+            ["突破幅度合理", "站上基期高點後漲太多（噴出）會被扣分，避免追高"],
+          ]}
+        />
+        <p style={{ color: "#5c6070", fontSize: 12, lineHeight: 1.7, marginTop: 12, marginBottom: 0 }}>
+          分數只是排序用的輔助指標：除權息調整、假突破、剛IPO資料不足、有無重大事件干擾，
+          電腦都判斷不出來，仍建議用「看線圖」肉眼複核分數高的幾檔再決定。
+        </p>
+      </Panel>
+
       <Panel eyebrow="心態" title="重要提醒">
         <ChecklistStatic
           items={[
             "濾網是「低標」，不是保證獲利的完美策略",
             "停損價永遠優先於任何均線，跌破就出場",
             "所有出場行為都必須有 SOP 規則依據，不能憑感覺",
-            "電腦選股只是初篩，最終仍要靠人工判斷型態",
+            "電腦選股（含型態分數）只是初篩與排序，最終仍要靠人工判斷型態",
           ]}
         />
       </Panel>
