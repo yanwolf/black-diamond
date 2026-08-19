@@ -342,7 +342,10 @@ function SettingsPanel({ settings, onSaved }) {
     setTesting(true);
     setTestResult("");
     try {
-      await apiSend("POST", "/momentum/telegram-test");
+      await apiSend("POST", "/momentum/telegram-test", {
+        bot_token: draft.telegram_bot_token,
+        chat_id: draft.telegram_chat_id,
+      });
       setTestResult("✓ 測試訊息已送出，請檢查 Telegram");
     } catch (e) {
       setTestResult("✗ " + e.message);
@@ -473,6 +476,10 @@ function SettingsPanel({ settings, onSaved }) {
             <span style={{ fontSize: 12, color: testResult.startsWith("✓") ? "#4CC98A" : "#E5484D" }}>{testResult}</span>
           )}
         </div>
+        <p style={{ color: "#5c6070", fontSize: 11, marginTop: 8, marginBottom: 0 }}>
+          測試會直接用上面畫面上的 Token / Chat ID，不用先按「儲存設定」。正式排程通知則需要
+          先勾選「啟用 Telegram 通知」並儲存，才會真的發送。
+        </p>
       </div>
 
       {saveError && <div style={{ color: "#E5484D", fontSize: 13, marginTop: 14 }}>{saveError}</div>}

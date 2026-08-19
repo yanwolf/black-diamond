@@ -112,6 +112,11 @@ class MomentumStateOverride(BaseModel):
     note: Optional[str] = None   # 順便記錄這次為什麼手動override，會附加到最新一筆歷史紀錄
 
 
+class MomentumTelegramTestRequest(BaseModel):
+    bot_token: Optional[str] = None
+    chat_id: Optional[str] = None
+
+
 class MomentumHistoryNote(BaseModel):
     note: str
 
@@ -279,6 +284,27 @@ def _run_job(symbols, cfg: ScreenerConfig, mode: str):
             sched["last_run_at"] = _now_iso()
             sched["last_result_count"] = result.get("candidate_count")
             storage.save("schedule", sched)
+
+            # 全市場掃描完成後通知（跟超速大盤共用同一組 Telegram 設定），
+            # 讓使用者知道可以進來做人工複核，不用一直開著網頁等
+            candidates = result.get("candidates", [])
+            scored = sorted(
+                (c for c in candidates if c.get("pattern_score") is not None),
+                key=lambda c: c["pattern_score"],
+                reverse=True,
+            )[:5]
+            if scored:
+                top_lines = "\n".join(f"  {c['symbol']} ({c['pattern_score']}分)" for c in scored)
+            elif candidates:
+                top_lines = "  （尚未算出型態分數）"
+            else:
+                top_lines = "  （本次無候選股通過濾網）"
+            send_telegram_message(
+                f"[黑鑽選股] 全市場掃描完成：從 {result.get('universe_size')} 檔中篩選出 "
+                f"{result.get('candidate_count')} 檔候選股。\n"
+                f"型態分數最高幾檔：\n{top_lines}\n"
+                f"請進來「選股清單」做人工複核。"
+            )
     except Exception as e:
         storage.save("symbol_cache", cache)  # 就算失敗也保留已查到的部分，避免全部浪費
         with _job_lock:
@@ -504,6 +530,21 @@ def _get_daily_close(symbol: str, on_date: date) -> Optional[float]:
     return round(float(hist.iloc[-1]["Close"]), 4)
 
 
+def _is_trading_day(symbol: str, on_date: date) -> bool:
+    """
+    直接問市場資料「這天真的有開盤嗎」，不只是排除週末——
+    美股假日（感恩節、聖誕節等）雖然是平日，市場一樣休市，這裡會一併偵測到。
+    """
+    try:
+        ticker = yf.Ticker(symbol)
+        hist = ticker.history(start=on_date, end=on_date + timedelta(days=1), interval="1d")
+    except Exception:
+        return False
+    if hist is None or hist.empty:
+        return False
+    return any(d == on_date for d in hist.index.date)
+
+
 def _get_daily_open(symbol: str, on_date: date) -> Optional[float]:
     """抓 on_date 當天（或往後找最近一個有資料的交易日）的開盤價。"""
     try:
@@ -519,12 +560,7 @@ def _get_daily_open(symbol: str, on_date: date) -> Optional[float]:
     return round(float(hist.iloc[0]["Open"]), 4)
 
 
-def send_telegram_message(text: str) -> bool:
-    settings = storage.load("momentum_settings")
-    if not settings.get("telegram_enabled"):
-        return False
-    token = settings.get("telegram_bot_token")
-    chat_id = settings.get("telegram_chat_id")
+def _telegram_post(token: str, chat_id: str, text: str) -> bool:
     if not token or not chat_id:
         return False
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -532,8 +568,16 @@ def send_telegram_message(text: str) -> bool:
         resp = http_requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=10)
         return resp.ok
     except Exception as e:
-        print(f"[momentum] Telegram 發送失敗: {e}")
+        print(f"[telegram] 發送失敗: {e}")
         return False
+
+
+def send_telegram_message(text: str) -> bool:
+    """給排程/自動流程用：讀取已儲存的設定，且尊重 telegram_enabled 開關。"""
+    settings = storage.load("momentum_settings")
+    if not settings.get("telegram_enabled"):
+        return False
+    return _telegram_post(settings.get("telegram_bot_token"), settings.get("telegram_chat_id"), text)
 
 
 def run_momentum_check() -> dict:
@@ -650,6 +694,12 @@ def momentum_daily_job():
         if today < target_day:
             return  # 還沒到本月的檢查日
 
+        # 目標日可能剛好遇到平日休市的美股假日（感恩節、聖誕節等），不只是週末。
+        # 這裡直接問市場資料「今天真的有開盤嗎」，沒開盤就先跳過，明天排程再檢查一次，
+        # 直到遇到真正有開盤的日子才會執行讀值判斷，不會用到假日前的舊收盤價。
+        if not _is_trading_day(settings["benchmark_symbol"], today):
+            return  # 今天休市，明天排程會再確認一次
+
         run_momentum_check()
     except Exception as e:
         print(f"[momentum] 每日排程失敗: {e}")
@@ -727,13 +777,18 @@ def momentum_check_now_endpoint(force: bool = False):
 
 
 @app.post("/api/momentum/telegram-test")
-def momentum_telegram_test():
+def momentum_telegram_test(payload: Optional[MomentumTelegramTestRequest] = Body(default=None)):
+    """
+    測試按鈕直接送「畫面上目前的Token/Chat ID」（若有提供），不用先按「儲存設定」，
+    也不要求 telegram_enabled 開關（測試本來就是為了在啟用前先確認能不能收到）。
+    沒有從前端帶參數時，才退回讀已儲存的設定。
+    """
     settings = storage.load("momentum_settings")
-    if not settings.get("telegram_enabled"):
-        raise HTTPException(400, "請先在設定中開啟 Telegram 通知")
-    if not settings.get("telegram_bot_token") or not settings.get("telegram_chat_id"):
+    token = (payload.bot_token if payload and payload.bot_token else settings.get("telegram_bot_token"))
+    chat_id = (payload.chat_id if payload and payload.chat_id else settings.get("telegram_chat_id"))
+    if not token or not chat_id:
         raise HTTPException(400, "請先填寫 Bot Token 與 Chat ID")
-    ok = send_telegram_message("[超速大盤] 這是一則測試訊息，收到代表 Telegram 通知設定成功。")
+    ok = _telegram_post(token, chat_id, "[超速大盤] 這是一則測試訊息，收到代表 Telegram 通知設定成功。")
     if not ok:
         raise HTTPException(502, "傳送失敗，請確認 Bot Token / Chat ID 是否正確")
     return {"sent": True}
