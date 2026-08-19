@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useMemo, useCallback } from "react";
 import ChartModal from "./ChartModal.jsx";
+import MomentumTab from "./MomentumTab.jsx";
 
 /* ============================================================
    黑鑽選股儀表板 — Black Diamond Screener Dashboard
@@ -287,6 +288,7 @@ export default function App() {
                 openChart={openChart}
               />
             )}
+            {tab === "momentum" && <MomentumTab />}
             {tab === "sop" && <SopTab />}
           </>
         )}
@@ -310,6 +312,7 @@ function Header({ tab, setTab }) {
     { key: "screen", label: "選股清單" },
     { key: "calc", label: "停損停利計算" },
     { key: "holdings", label: "持股追蹤" },
+    { key: "momentum", label: "超速大盤" },
     { key: "sop", label: "SOP速查" },
   ];
   return (

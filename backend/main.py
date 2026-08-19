@@ -11,7 +11,7 @@ import os
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date, timedelta
 from typing import Optional, List
 
 from fastapi import FastAPI, HTTPException, Body
@@ -21,15 +21,19 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.cron import CronTrigger
 import yfinance as yf
 import pandas as pd
+import requests as http_requests
 
 import storage
+import momentum
 from engine import ScreenerConfig, run_screener, fetch_nasdaq_universe, analyze_pattern
 
 app = FastAPI(title="黑鑽選股系統 API")
 scheduler = BackgroundScheduler(timezone="UTC")
 SCHEDULE_JOB_ID = "full_market_scan"
+MOMENTUM_JOB_ID = "momentum_daily_check"
 
 # 個股快取有效時數：這段時間內已檢查過的股票，重新掃描時會直接沿用結果，不再打 Yahoo Finance
 CACHE_FRESHNESS_HOURS = float(os.environ.get("CACHE_FRESHNESS_HOURS", 24))
@@ -75,6 +79,41 @@ class ScreenRequest(BaseModel):
 class ScheduleConfig(BaseModel):
     enabled: bool = False
     interval_hours: float = 168   # 預設每週掃描一次
+
+
+class MomentumSettings(BaseModel):
+    benchmark_symbol: str = "QQQ"
+    trade_symbol: str = "QLD"
+    initial_capital: float = 0
+    check_day_of_month: int = 11
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+    telegram_enabled: bool = False
+    auto_schedule_enabled: bool = False
+
+
+class MomentumImportRow(BaseModel):
+    date: str    # "YYYY-MM-DD"
+    price: float
+
+
+class MomentumImportRequest(BaseModel):
+    history: List[MomentumImportRow]
+    position: str = "cash"   # "stock" | "cash"
+    shares: float = 0
+    cash: float = 0
+    initial_capital: float = 0
+
+
+class MomentumStateOverride(BaseModel):
+    position: str          # "stock" | "cash"
+    shares: float = 0
+    cash: float = 0
+    note: Optional[str] = None   # 順便記錄這次為什麼手動override，會附加到最新一筆歷史紀錄
+
+
+class MomentumHistoryNote(BaseModel):
+    note: str
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +377,13 @@ def on_startup():
     cfg = storage.load("schedule")
     if cfg.get("enabled"):
         _apply_schedule(cfg)
+    # 超速大盤策略：每天固定時間跑一次（內部會自行判斷今天要不要真的動作）
+    scheduler.add_job(
+        momentum_daily_job,
+        trigger=CronTrigger(hour=21, minute=30),  # UTC 21:30，約當美股收盤後
+        id=MOMENTUM_JOB_ID,
+        replace_existing=True,
+    )
 
 
 @app.on_event("shutdown")
@@ -438,6 +484,291 @@ def get_chart(symbol: str, period: str = "5y", interval: str = "1wk"):
         raise HTTPException(404, str(e))
     except Exception as e:
         raise HTTPException(502, f"取得 {symbol} 歷史股價失敗: {e}")
+
+
+# ---------------------------------------------------------------------------
+# 超速大盤策略 (Momentum Overdrive)
+# ---------------------------------------------------------------------------
+def _get_daily_close(symbol: str, on_date: date) -> Optional[float]:
+    """抓 on_date 當天（或最近一個更早的交易日，例如遇到假日）的收盤價。"""
+    try:
+        ticker = yf.Ticker(symbol)
+        hist = ticker.history(start=on_date - timedelta(days=10), end=on_date + timedelta(days=1), interval="1d")
+    except Exception:
+        return None
+    if hist is None or hist.empty:
+        return None
+    hist = hist[hist.index.date <= on_date]
+    if hist.empty:
+        return None
+    return round(float(hist.iloc[-1]["Close"]), 4)
+
+
+def _get_daily_open(symbol: str, on_date: date) -> Optional[float]:
+    """抓 on_date 當天（或往後找最近一個有資料的交易日）的開盤價。"""
+    try:
+        ticker = yf.Ticker(symbol)
+        hist = ticker.history(start=on_date, end=on_date + timedelta(days=7), interval="1d")
+    except Exception:
+        return None
+    if hist is None or hist.empty:
+        return None
+    hist = hist[hist.index.date >= on_date]
+    if hist.empty:
+        return None
+    return round(float(hist.iloc[0]["Open"]), 4)
+
+
+def send_telegram_message(text: str) -> bool:
+    settings = storage.load("momentum_settings")
+    if not settings.get("telegram_enabled"):
+        return False
+    token = settings.get("telegram_bot_token")
+    chat_id = settings.get("telegram_chat_id")
+    if not token or not chat_id:
+        return False
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        resp = http_requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=10)
+        return resp.ok
+    except Exception as e:
+        print(f"[momentum] Telegram 發送失敗: {e}")
+        return False
+
+
+def run_momentum_check() -> dict:
+    """
+    執行一次「讀值判斷」：抓基準ETF今日收盤價、計算動能指標、決定是否需要換倉。
+    若需要換倉，只會記錄「預計換倉」，實際成交要等隔天 momentum_daily_job 抓到開盤價才會執行、
+    對應原Excel「隔天日期／QLD開盤價」的兩階段流程。
+    """
+    today = datetime.now(timezone.utc).date()
+    settings = storage.load("momentum_settings")
+    state = storage.load("momentum_state")
+    history = storage.load("momentum_history")
+
+    price = _get_daily_close(settings["benchmark_symbol"], today)
+    if price is None:
+        raise RuntimeError(f"取得 {settings['benchmark_symbol']} 收盤價失敗，請稍後再試")
+
+    calc = momentum.compute_momentum(history, price)
+    row = {
+        "date": today.isoformat(),
+        "price": price,
+        **calc,
+        "execution_date": None,
+        "execution_price": None,
+        "shares_after": state["shares"],
+        "cash_after": state["cash"],
+        "position_value": None,
+        "total_value": None,
+        "cumulative_return": None,
+        "note": None,
+    }
+
+    prev_position = "hold_stock" if state["shares"] > 0 else "hold_cash"
+    needs_trade = calc["action"] is not None and calc["action"] != prev_position
+
+    if needs_trade:
+        exec_date = momentum.next_trading_day(today)
+        state["pending_trade"] = {"execution_date": exec_date.isoformat(), "target_action": calc["action"]}
+        row["execution_date"] = exec_date.isoformat()
+
+    state["last_check_date"] = today.isoformat()
+    state["last_check_month"] = today.strftime("%Y-%m")
+
+    history.append(row)
+    storage.save("momentum_history", history)
+    storage.save("momentum_state", state)
+
+    if needs_trade:
+        action_label = momentum.ACTION_LABELS[calc["action"]]
+        momentum_pct = f"{calc['momentum']*100:.1f}%" if calc["momentum"] is not None else "—"
+        send_telegram_message(
+            f"[超速大盤] 訊號更新：綜合動能指標 {momentum_pct}，建議「{action_label}」。\n"
+            f"將於 {row['execution_date']} 開盤依 {settings['trade_symbol']} 開盤價自動記錄換倉，"
+            f"請留意帳戶並視需要人工操作。"
+        )
+
+    return row
+
+
+def momentum_daily_job():
+    """每日排程：優先處理未完成的換倉（隔日開盤價執行），沒有的話再檢查是否輪到本月讀值判斷。"""
+    try:
+        today = datetime.now(timezone.utc).date()
+        settings = storage.load("momentum_settings")
+        state = storage.load("momentum_state")
+
+        pending = state.get("pending_trade")
+        if pending:
+            exec_date = date.fromisoformat(pending["execution_date"])
+            if today >= exec_date:
+                open_price = _get_daily_open(settings["trade_symbol"], exec_date)
+                if open_price is not None:
+                    trade = momentum.execute_trade(
+                        pending["target_action"], open_price, state["shares"], state["cash"]
+                    )
+                    state["shares"] = trade["shares_after"]
+                    state["cash"] = trade["cash_after"]
+                    state["position"] = "stock" if trade["shares_after"] > 0 else "cash"
+                    state["pending_trade"] = None
+                    storage.save("momentum_state", state)
+
+                    history = storage.load("momentum_history")
+                    if history:
+                        h = history[-1]
+                        h["execution_date"] = exec_date.isoformat()
+                        h["execution_price"] = open_price
+                        h["shares_after"] = trade["shares_after"]
+                        h["cash_after"] = trade["cash_after"]
+                        total_value = round(trade["shares_after"] * open_price + trade["cash_after"], 2)
+                        h["position_value"] = round(trade["shares_after"] * open_price, 2)
+                        h["total_value"] = total_value
+                        ic = settings.get("initial_capital") or 0
+                        h["cumulative_return"] = round((total_value - ic) / ic, 6) if ic else None
+                        storage.save("momentum_history", history)
+
+                    if trade["traded"]:
+                        verb = "買進" if pending["target_action"] == "hold_stock" else "賣出"
+                        send_telegram_message(
+                            f"[超速大盤] 已於 {exec_date} 依開盤價 ${open_price:.2f} 完成{verb} "
+                            f"{settings['trade_symbol']}，目前持有 {trade['shares_after']} 股，"
+                            f"現金 ${trade['cash_after']:.2f}"
+                        )
+                return  # 這輪先處理完換倉執行，讀值判斷留給沒有 pending 時再做
+
+        if not settings.get("auto_schedule_enabled"):
+            return
+
+        this_month = today.strftime("%Y-%m")
+        if state.get("last_check_month") == this_month:
+            return  # 這個月已經判斷過了
+
+        target_day_num = min(max(int(settings.get("check_day_of_month", 11)), 1), 28)
+        target_day = momentum.on_or_after_weekday(date(today.year, today.month, target_day_num))
+        if today < target_day:
+            return  # 還沒到本月的檢查日
+
+        run_momentum_check()
+    except Exception as e:
+        print(f"[momentum] 每日排程失敗: {e}")
+
+
+@app.get("/api/momentum/settings")
+def get_momentum_settings():
+    return storage.load("momentum_settings")
+
+
+@app.put("/api/momentum/settings")
+def put_momentum_settings(settings: MomentumSettings):
+    storage.save("momentum_settings", settings.dict())
+    return settings.dict()
+
+
+@app.get("/api/momentum/state")
+def get_momentum_state():
+    return storage.load("momentum_state")
+
+
+@app.put("/api/momentum/state")
+def override_momentum_state(override: MomentumStateOverride):
+    """
+    手動調整目前部位（例如像使用者這次一樣，主觀判斷要偏離規則自行出場/進場）。
+    這不會跑動能計算，純粹是「告訴系統我實際上手動做了什麼」，
+    同時會清掉任何待執行的自動換倉，避免系統隔天又依照舊訊號重複動作。
+    """
+    if override.position not in ("stock", "cash"):
+        raise HTTPException(400, "position 必須是 'stock' 或 'cash'")
+
+    state = storage.load("momentum_state")
+    state["position"] = override.position
+    state["shares"] = override.shares
+    state["cash"] = override.cash
+    state["pending_trade"] = None
+    storage.save("momentum_state", state)
+
+    if override.note:
+        history = storage.load("momentum_history")
+        if history:
+            existing = history[-1].get("note", "")
+            history[-1]["note"] = (existing + " / " if existing else "") + f"[手動override] {override.note}"
+            storage.save("momentum_history", history)
+
+    return state
+
+
+@app.put("/api/momentum/history/{row_date}/note")
+def set_momentum_history_note(row_date: str, payload: MomentumHistoryNote):
+    history = storage.load("momentum_history")
+    for row in history:
+        if row.get("date") == row_date:
+            row["note"] = payload.note
+            storage.save("momentum_history", history)
+            return row
+    raise HTTPException(404, f"找不到日期為 {row_date} 的歷史紀錄")
+
+
+@app.get("/api/momentum/history")
+def get_momentum_history():
+    return storage.load("momentum_history")
+
+
+@app.post("/api/momentum/check-now")
+def momentum_check_now_endpoint(force: bool = False):
+    if force:
+        state = storage.load("momentum_state")
+        state["last_check_month"] = None
+        storage.save("momentum_state", state)
+    try:
+        return run_momentum_check()
+    except Exception as e:
+        raise HTTPException(502, str(e))
+
+
+@app.post("/api/momentum/telegram-test")
+def momentum_telegram_test():
+    settings = storage.load("momentum_settings")
+    if not settings.get("telegram_enabled"):
+        raise HTTPException(400, "請先在設定中開啟 Telegram 通知")
+    if not settings.get("telegram_bot_token") or not settings.get("telegram_chat_id"):
+        raise HTTPException(400, "請先填寫 Bot Token 與 Chat ID")
+    ok = send_telegram_message("[超速大盤] 這是一則測試訊息，收到代表 Telegram 通知設定成功。")
+    if not ok:
+        raise HTTPException(502, "傳送失敗，請確認 Bot Token / Chat ID 是否正確")
+    return {"sent": True}
+
+
+@app.post("/api/momentum/import")
+def import_momentum_history(req: MomentumImportRequest):
+    rows_sorted = sorted(req.history, key=lambda r: r.date)
+    history = []
+    for r in rows_sorted:
+        calc = momentum.compute_momentum(history, r.price)
+        history.append({
+            "date": r.date, "price": r.price, **calc,
+            "execution_date": None, "execution_price": None,
+            "shares_after": None, "cash_after": None,
+            "position_value": None, "total_value": None, "cumulative_return": None,
+            "note": None,
+        })
+    storage.save("momentum_history", history)
+
+    state = {
+        "position": "stock" if req.position == "stock" else "cash",
+        "shares": req.shares,
+        "cash": req.cash,
+        "last_check_date": rows_sorted[-1].date if rows_sorted else None,
+        "last_check_month": rows_sorted[-1].date[:7] if rows_sorted else None,
+        "pending_trade": None,
+    }
+    storage.save("momentum_state", state)
+
+    settings = storage.load("momentum_settings")
+    settings["initial_capital"] = req.initial_capital
+    storage.save("momentum_settings", settings)
+
+    return {"imported_rows": len(history), "state": state}
 
 
 # ---------------------------------------------------------------------------

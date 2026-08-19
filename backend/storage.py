@@ -30,6 +30,25 @@ DEFAULTS = {
         "next_run_at": None,
     },
     "symbol_cache": {},
+    "momentum_settings": {
+        "benchmark_symbol": "QQQ",     # 用來計算動能指標的基準ETF
+        "trade_symbol": "QLD",         # 實際交易標的
+        "initial_capital": 0,
+        "check_day_of_month": 11,      # 每月檢查日（若非交易日會順延到下一個交易日）
+        "telegram_bot_token": "",
+        "telegram_chat_id": "",
+        "telegram_enabled": False,
+        "auto_schedule_enabled": False,
+    },
+    "momentum_state": {
+        "position": "cash",            # "stock" | "cash"
+        "shares": 0,
+        "cash": 0,
+        "last_check_date": None,       # 最近一次「讀值判斷」的日期
+        "last_check_month": None,      # "YYYY-MM"，避免同一個月重複判斷
+        "pending_trade": None,         # {"execution_date":..., "target_action":...} 或 None
+    },
+    "momentum_history": [],
 }
 
 
