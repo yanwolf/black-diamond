@@ -739,6 +739,60 @@ def momentum_telegram_test():
     return {"sent": True}
 
 
+@app.post("/api/momentum/telegram-fetch-chat-id")
+def fetch_telegram_chat_id(payload: dict = Body(...)):
+    """
+    自動抓 Chat ID，取代「使用者自己組 getUpdates 網址」的手動流程：
+      1. 使用者先傳一則訊息（例如 /start）給自己的 Bot
+      2. 這裡呼叫 getUpdates 找最新一筆訊息的 chat id
+      3. 若該 Bot 之前設過 webhook，getUpdates 會失敗，這裡會自動先移除 webhook 再重試一次
+    """
+    token = (payload.get("bot_token") or "").strip()
+    if not token:
+        raise HTTPException(400, "請先輸入 Bot Token")
+
+    base = f"https://api.telegram.org/bot{token}"
+
+    def call_get_updates():
+        resp = http_requests.get(f"{base}/getUpdates", timeout=10)
+        return resp.json()
+
+    try:
+        data = call_get_updates()
+    except Exception as e:
+        raise HTTPException(502, f"連線 Telegram 失敗: {e}")
+
+    if not data.get("ok"):
+        desc = data.get("description", "")
+        if "webhook" in desc.lower():
+            # 常見情況：Bot 之前被設定過 webhook，getUpdates 無法使用，自動移除後重試一次
+            try:
+                http_requests.get(f"{base}/deleteWebhook", timeout=10)
+                data = call_get_updates()
+            except Exception as e:
+                raise HTTPException(502, f"移除 webhook 後仍連線失敗: {e}")
+        if not data.get("ok"):
+            raise HTTPException(400, f"Telegram 回應錯誤：{desc or data.get('description', '未知錯誤')}，請確認 Bot Token 是否正確")
+
+    results = data.get("result", [])
+    if not results:
+        raise HTTPException(
+            404,
+            "沒有偵測到任何訊息。請先在 Telegram 搜尋你的 Bot，傳一則訊息給它（例如輸入 /start），"
+            "再按一次「自動取得 Chat ID」。",
+        )
+
+    last = results[-1]
+    msg = last.get("message") or last.get("channel_post") or last.get("edited_message") or {}
+    chat = msg.get("chat", {})
+    chat_id = chat.get("id")
+    if chat_id is None:
+        raise HTTPException(404, "抓到的訊息中沒有 chat id，請重新傳一則訊息給 Bot 後再試一次")
+
+    display_name = chat.get("username") or chat.get("first_name") or chat.get("title") or str(chat_id)
+    return {"chat_id": str(chat_id), "display_name": display_name}
+
+
 @app.post("/api/momentum/import")
 def import_momentum_history(req: MomentumImportRequest):
     rows_sorted = sorted(req.history, key=lambda r: r.date)

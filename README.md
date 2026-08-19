@@ -172,8 +172,11 @@ Excel公式核對過，逐項數字都能重現）：
 
 ### 关于 Telegram Bot 設定
 
-跟 @BotFather 對話建立一個新 Bot，取得 Bot Token；跟你的 Bot 傳一則訊息後，
-用 @userinfobot 或造訪 `https://api.telegram.org/bot<TOKEN>/getUpdates` 找到你的 Chat ID。
+跟 @BotFather 對話建立一個新 Bot，取得 Bot Token 貼到「超速大盤」分頁的設定裡；
+接著傳一則訊息（例如 `/start`）給你的 Bot；回到頁面按「自動取得 Chat ID」，
+後端會呼叫 Telegram 的 `getUpdates` 自動抓出 Chat ID 幫你填好，不用自己組API網址查。
+如果這個 Bot 之前設定過 webhook 導致 `getUpdates` 沒反應，後端會自動先移除 webhook 再重試一次。
+如果按了還是抓不到，代表 Telegram 那邊真的還沒收到你傳的訊息，先確認訊息有送出去再重試。
 
 4. **貼上 candidates.json 匯入**：如果想在本機先跑好再匯入（例如想調整
    濾網參數做離線測試），可以：

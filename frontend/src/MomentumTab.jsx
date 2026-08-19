@@ -316,6 +316,8 @@ function SettingsPanel({ settings, onSaved }) {
   const [saveError, setSaveError] = useState("");
   const [testResult, setTestResult] = useState("");
   const [testing, setTesting] = useState(false);
+  const [fetchingChatId, setFetchingChatId] = useState(false);
+  const [fetchChatIdMsg, setFetchChatIdMsg] = useState("");
 
   useEffect(() => {
     setDraft(settings);
@@ -346,6 +348,20 @@ function SettingsPanel({ settings, onSaved }) {
       setTestResult("✗ " + e.message);
     } finally {
       setTesting(false);
+    }
+  }
+
+  async function fetchChatId() {
+    setFetchingChatId(true);
+    setFetchChatIdMsg("");
+    try {
+      const result = await apiSend("POST", "/momentum/telegram-fetch-chat-id", { bot_token: draft.telegram_bot_token });
+      setDraft({ ...draft, telegram_chat_id: result.chat_id });
+      setFetchChatIdMsg(`✓ 已自動填入，偵測到帳號：${result.display_name}`);
+    } catch (e) {
+      setFetchChatIdMsg("✗ " + e.message);
+    } finally {
+      setFetchingChatId(false);
     }
   }
 
@@ -400,10 +416,21 @@ function SettingsPanel({ settings, onSaved }) {
       <div style={{ marginTop: 20, paddingTop: 20, borderTop: "1px solid #23262f" }}>
         <MiniLabel>Telegram 通知</MiniLabel>
         <p style={{ color: "#8B90A0", fontSize: 13, lineHeight: 1.7, margin: "4px 0 12px" }}>
-          需要出場或進場時（訊號轉換）、以及實際換倉完成時會發送通知。找 @BotFather 建立Bot取得Token，
-          傳訊息給你的Bot後用 @userinfobot 或 Bot API 的 getUpdates 取得 Chat ID。
+          需要出場或進場時（訊號轉換）、以及實際換倉完成時會發送通知。設定步驟：
         </p>
-        <div style={{ display: "flex", gap: 20, flexWrap: "wrap" }}>
+        <ol style={{ color: "#8B90A0", fontSize: 13, lineHeight: 1.9, margin: "0 0 14px", paddingLeft: 20 }}>
+          <li>
+            在 Telegram 搜尋 <span style={{ color: "#E8C275" }}>@BotFather</span>，傳 <code style={{ color: "#E8C275" }}>/newbot</code>{" "}
+            建立一個新 Bot，取得 <strong style={{ color: "#EDEFF3" }}>Bot Token</strong>，貼到下方欄位
+          </li>
+          <li>
+            在 Telegram 搜尋你剛建立的 Bot，傳一則訊息給它（例如輸入 <code style={{ color: "#E8C275" }}>/start</code>）
+          </li>
+          <li>
+            回到這裡按「<strong style={{ color: "#EDEFF3" }}>自動取得 Chat ID</strong>」，會自動幫你填好，不用自己組API網址查
+          </li>
+        </ol>
+        <div style={{ display: "flex", gap: 20, flexWrap: "wrap", alignItems: "flex-end" }}>
           <Field label="Bot Token">
             <input
               type="password"
@@ -421,8 +448,16 @@ function SettingsPanel({ settings, onSaved }) {
               placeholder="123456789"
             />
           </Field>
+          <GhostButton small onClick={fetchChatId} disabled={fetchingChatId || !draft.telegram_bot_token}>
+            {fetchingChatId ? "偵測中…" : "自動取得 Chat ID"}
+          </GhostButton>
         </div>
-        <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, color: "#C7CAD4", cursor: "pointer", marginTop: 12 }}>
+        {fetchChatIdMsg && (
+          <div style={{ fontSize: 12, marginTop: 8, color: fetchChatIdMsg.startsWith("✓") ? "#4CC98A" : "#E5484D" }}>
+            {fetchChatIdMsg}
+          </div>
+        )}
+        <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, color: "#C7CAD4", cursor: "pointer", marginTop: 14 }}>
           <input
             type="checkbox"
             checked={draft.telegram_enabled}
