@@ -736,7 +736,7 @@ function ScreenTab({
             <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
               <thead>
                 <tr>
-                  {cols.map((c) => (
+                  {cols.map((c, i) => (
                     <th
                       key={c.key}
                       onClick={() => toggleSort(c.key)}
@@ -750,6 +750,7 @@ function ScreenTab({
                         whiteSpace: "nowrap",
                         fontFamily: "'JetBrains Mono', monospace",
                         fontSize: 11,
+                        ...(i === 0 ? stickyColStyle(3) : {}),
                       }}
                     >
                       {c.label} {sortKey === c.key ? (sortDir === "asc" ? "▲" : "▼") : ""}
@@ -761,7 +762,7 @@ function ScreenTab({
               <tbody>
                 {candidates.map((c) => (
                   <tr key={c._id || c.symbol} style={{ borderBottom: "1px solid #1c1f27" }}>
-                    <td style={cellStyle}>
+                    <td style={{ ...cellStyle, ...stickyColStyle(2) }}>
                       <button
                         onClick={() =>
                           openChart(c.symbol, [
@@ -805,8 +806,8 @@ function ScreenTab({
                     </td>
                     <td style={{ ...cellStyle, fontFamily: "'JetBrains Mono', monospace" }}>{fmt.money(c.avg_volume)}</td>
                     <td style={cellStyle}>{c.exchange || "—"}</td>
-                    <td style={cellStyle}>
-                      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                    <td style={{ ...cellStyle, minWidth: 88 }}>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 6, alignItems: "flex-start" }}>
                         <GhostButton
                           small
                           onClick={() =>
@@ -852,6 +853,17 @@ function ScreenTab({
 }
 
 const cellStyle = { padding: "10px", verticalAlign: "top" };
+
+/* 讓表格第一欄（代碼）橫向捲動時固定在左邊，避免捲到後面欄位時忘記自己在看哪一檔 */
+function stickyColStyle(zIndex) {
+  return {
+    position: "sticky",
+    left: 0,
+    zIndex,
+    background: "#14161c",
+    borderRight: "1px solid #23262f",
+  };
+}
 
 function JobProgress({ status }) {
   if (!status) return null;
@@ -1157,6 +1169,8 @@ function HoldingCard({ holding, onChange, onRemove, openChart }) {
           padding: "6px 10px",
           cursor: "pointer",
           fontSize: 12,
+          whiteSpace: "nowrap",
+          flexShrink: 0,
         }}
       >
         刪除
@@ -1300,6 +1314,8 @@ function GoldButton({ children, onClick, disabled }) {
         fontSize: 13,
         cursor: disabled ? "not-allowed" : "pointer",
         clipPath: "polygon(0 0, calc(100% - 8px) 0, 100% 100%, 8px 100%)",
+        whiteSpace: "nowrap",
+        flexShrink: 0,
       }}
     >
       {children}
@@ -1319,6 +1335,8 @@ function GhostButton({ children, onClick, small }) {
         fontWeight: 500,
         fontSize: small ? 12 : 13,
         cursor: "pointer",
+        whiteSpace: "nowrap",
+        flexShrink: 0,
       }}
     >
       {children}

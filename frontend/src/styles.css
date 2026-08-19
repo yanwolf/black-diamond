@@ -17,6 +17,11 @@ body {
   box-sizing: border-box;
 }
 
+/* 全域防呆：按鈕文字（尤其中文）在窄容器裡不會被壓縮到逐字換行 */
+button {
+  white-space: nowrap;
+}
+
 #root {
   overflow-x: hidden;
 }

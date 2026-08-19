@@ -572,7 +572,7 @@ function HistoryPanel({ history, onRefresh }) {
           <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
             <thead>
               <tr>
-                {["讀值日", "基準價", "1個月", "3個月", "6個月", "綜合動能", "建議動作", "換倉日", "換倉價", "股數", "現金", "資產總額", "累計報酬", "備註"].map((h) => (
+                {["讀值日", "基準價", "1個月", "3個月", "6個月", "綜合動能", "建議動作", "換倉日", "換倉價", "股數", "現金", "資產總額", "累計報酬", "備註"].map((h, i) => (
                   <th
                     key={h}
                     style={{
@@ -584,6 +584,7 @@ function HistoryPanel({ history, onRefresh }) {
                       whiteSpace: "nowrap",
                       fontFamily: "'JetBrains Mono', monospace",
                       fontSize: 11,
+                      ...(i === 0 ? stickyColStyle(3) : {}),
                     }}
                   >
                     {h}
@@ -594,7 +595,7 @@ function HistoryPanel({ history, onRefresh }) {
             <tbody>
               {rows.map((h, i) => (
                 <tr key={i} style={{ borderBottom: "1px solid #1c1f27" }}>
-                  <td style={cellStyle}>{h.date}</td>
+                  <td style={{ ...cellStyle, ...stickyColStyle(2) }}>{h.date}</td>
                   <td style={{ ...cellStyle, fontFamily: "'JetBrains Mono', monospace" }}>${fmt.money(h.price)}</td>
                   <td style={{ ...cellStyle, fontFamily: "'JetBrains Mono', monospace" }}>{h.perf_1m !== null ? fmt.pct(h.perf_1m) : "—"}</td>
                   <td style={{ ...cellStyle, fontFamily: "'JetBrains Mono', monospace" }}>{h.perf_3m !== null ? fmt.pct(h.perf_3m) : "—"}</td>
@@ -774,6 +775,8 @@ function GoldButton({ children, onClick, disabled }) {
         fontSize: 13,
         cursor: disabled ? "not-allowed" : "pointer",
         clipPath: "polygon(0 0, calc(100% - 8px) 0, 100% 100%, 8px 100%)",
+        whiteSpace: "nowrap",
+        flexShrink: 0,
       }}
     >
       {children}
@@ -794,6 +797,8 @@ function GhostButton({ children, onClick, small, disabled }) {
         fontWeight: 500,
         fontSize: small ? 12 : 13,
         cursor: disabled ? "not-allowed" : "pointer",
+        whiteSpace: "nowrap",
+        flexShrink: 0,
       }}
     >
       {children}
@@ -830,6 +835,17 @@ const inputStyle = {
 };
 
 const cellStyle = { padding: "8px 10px", verticalAlign: "top" };
+
+/* 讓表格第一欄（讀值日）橫向捲動時固定在左邊 */
+function stickyColStyle(zIndex) {
+  return {
+    position: "sticky",
+    left: 0,
+    zIndex,
+    background: "#14161c",
+    borderRight: "1px solid #23262f",
+  };
+}
 
 function EmptyState({ text }) {
   return (
