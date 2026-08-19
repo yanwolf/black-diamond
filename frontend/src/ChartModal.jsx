@@ -98,6 +98,7 @@ export default function ChartModal({ symbol, markers = [], onClose }) {
       }}
     >
       <div
+        className="app-modal-box"
         onClick={(e) => e.stopPropagation()}
         style={{
           width: "100%",
@@ -109,6 +110,7 @@ export default function ChartModal({ symbol, markers = [], onClose }) {
           clipPath:
             "polygon(0 0, calc(100% - 18px) 0, 100% 18px, 100% 100%, 18px 100%, 0 calc(100% - 18px))",
           padding: 24,
+          boxSizing: "border-box",
         }}
       >
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>

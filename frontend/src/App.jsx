@@ -242,7 +242,7 @@ export default function App() {
       }}
     >
       <Header tab={tab} setTab={setTab} />
-      <main style={{ maxWidth: 1100, margin: "0 auto", padding: "0 20px" }}>
+      <main className="app-main" style={{ maxWidth: 1100, margin: "0 auto", padding: "0 16px" }}>
         {loadError && (
           <div
             style={{
@@ -326,14 +326,14 @@ function Header({ tab, setTab }) {
         zIndex: 10,
       }}
     >
-      <div style={{ maxWidth: 1100, margin: "0 auto", padding: "20px 20px 0" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-          <Facet size={22} tone="gold" />
+      <div style={{ maxWidth: 1100, margin: "0 auto", padding: "16px 16px 0" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+          <Facet size={20} tone="gold" />
           <h1
             style={{
               fontFamily: "'Noto Serif TC', serif",
               fontWeight: 900,
-              fontSize: 26,
+              fontSize: "clamp(19px, 5vw, 26px)",
               letterSpacing: 1,
               margin: 0,
               color: "#F1E4C6",
@@ -341,11 +341,24 @@ function Header({ tab, setTab }) {
           >
             黑鑽選股
           </h1>
-          <span style={{ color: "#6B7080", fontSize: 13, marginLeft: 4 }}>
+          <span
+            className="app-subtitle"
+            style={{ color: "#6B7080", fontSize: 12, marginLeft: 2 }}
+          >
             Black Diamond Screener
           </span>
         </div>
-        <nav style={{ display: "flex", gap: 4, marginTop: 18 }}>
+        <nav
+          className="app-nav"
+          style={{
+            display: "flex",
+            gap: 2,
+            marginTop: 16,
+            overflowX: "auto",
+            WebkitOverflowScrolling: "touch",
+            scrollbarWidth: "none",
+          }}
+        >
           {tabs.map((t) => {
             const active = tab === t.key;
             return (
@@ -356,13 +369,15 @@ function Header({ tab, setTab }) {
                   background: "none",
                   border: "none",
                   cursor: "pointer",
-                  padding: "10px 16px",
-                  fontSize: 14,
+                  padding: "10px 14px",
+                  fontSize: 13,
                   fontWeight: 500,
                   color: active ? "#F1E4C6" : "#8B90A0",
                   borderBottom: active ? "2px solid #C9A15A" : "2px solid transparent",
                   fontFamily: "'Noto Sans TC', sans-serif",
                   transition: "color .15s",
+                  whiteSpace: "nowrap",
+                  flexShrink: 0,
                 }}
               >
                 {t.label}
@@ -381,6 +396,7 @@ function Header({ tab, setTab }) {
 function Panel({ children, style = {}, title, eyebrow }) {
   return (
     <section
+      className="app-panel"
       style={{
         background: "#14161c",
         border: "1px solid #23262f",
@@ -388,6 +404,9 @@ function Panel({ children, style = {}, title, eyebrow }) {
           "polygon(0 0, calc(100% - 14px) 0, 100% 14px, 100% 100%, 14px 100%, 0 calc(100% - 14px))",
         padding: 24,
         marginTop: 20,
+        maxWidth: "100%",
+        boxSizing: "border-box",
+        overflow: "hidden",
         ...style,
       }}
     >

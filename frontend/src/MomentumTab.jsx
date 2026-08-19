@@ -706,12 +706,16 @@ function NoteCell({ date, note, onSaved }) {
 function Panel({ children, title, eyebrow }) {
   return (
     <section
+      className="app-panel"
       style={{
         background: "#14161c",
         border: "1px solid #23262f",
         clipPath: "polygon(0 0, calc(100% - 14px) 0, 100% 14px, 100% 100%, 14px 100%, 0 calc(100% - 14px))",
         padding: 24,
         marginTop: 20,
+        maxWidth: "100%",
+        boxSizing: "border-box",
+        overflow: "hidden",
       }}
     >
       {(title || eyebrow) && (

@@ -1,0 +1,71 @@
+/* ============================================================
+   全域基礎樣式 + 手機版響應式調整
+   inline style 為主要視覺語言，這裡只處理版面在小螢幕會出問題的地方：
+   分頁列跑版、面板留白過大、表格/輸入框溢出畫面等。
+   ============================================================ */
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  overflow-x: hidden; /* 避免任何子元素意外撐寬造成整頁橫向捲動 */
+  background: #0a0b0f;
+  -webkit-text-size-adjust: 100%;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+#root {
+  overflow-x: hidden;
+}
+
+/* 分頁列：隱藏捲軸但保留可滑動，Safari/Chrome 用 ::-webkit-scrollbar，Firefox 用 scrollbar-width（已在inline style設定） */
+.app-nav::-webkit-scrollbar {
+  display: none;
+}
+
+/* 手機上不需要顯示英文副標題，節省寬度給分頁列 */
+@media (max-width: 480px) {
+  .app-subtitle {
+    display: none;
+  }
+}
+
+/* 面板留白在窄螢幕縮小，卡片切角圖形在極窄螢幕也不會被裁切 */
+@media (max-width: 640px) {
+  .app-panel {
+    padding: 16px !important;
+  }
+
+  .app-main {
+    padding-left: 12px !important;
+    padding-right: 12px !important;
+  }
+
+  .app-modal-box {
+    padding: 16px !important;
+  }
+
+  /* 表格字體與內距縮小，配合外層 overflow-x:auto 容器橫向滑動瀏覽 */
+  table {
+    font-size: 11px !important;
+  }
+
+  td,
+  th {
+    padding: 6px 8px !important;
+  }
+}
+
+/* 輸入框、下拉選單在極窄螢幕(<380px)不要因為固定寬度撐出版面 */
+@media (max-width: 380px) {
+  input[type="text"],
+  input[type="number"],
+  input[type="password"],
+  input[type="date"],
+  select {
+    max-width: 100%;
+  }
+}
