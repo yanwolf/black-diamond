@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useMemo, useCallback } from "react";
 import ChartModal from "./ChartModal.jsx";
 import MomentumTab from "./MomentumTab.jsx";
+import DiamondHoldingsTab from "./DiamondHoldingsTab.jsx";
 
 /* ============================================================
    黑鑽選股儀表板 — Black Diamond Screener Dashboard
@@ -76,7 +77,6 @@ export default function App() {
 
   const [settings, setSettings] = useState({ totalCapital: 500000, riskPct: 1 });
   const [candidates, setCandidates] = useState([]);
-  const [holdings, setHoldings] = useState([]);
   const [sortKey, setSortKey] = useState("pattern_score");
   const [sortDir, setSortDir] = useState("desc");
 
@@ -94,9 +94,8 @@ export default function App() {
 
   const refreshAll = useCallback(async () => {
     try {
-      const [s, , h] = await Promise.all([apiGet("/settings"), refreshCandidates(), apiGet("/holdings")]);
+      const [s] = await Promise.all([apiGet("/settings"), refreshCandidates()]);
       setSettings(s);
-      setHoldings(h || []);
       setLoadError("");
     } catch (e) {
       setLoadError("無法連線到後端 API：" + e.message);
@@ -182,19 +181,6 @@ export default function App() {
     setCandidates(data.candidates || []);
   }
 
-  async function addHolding(payload) {
-    const created = await apiSend("POST", "/holdings", payload);
-    setHoldings((h) => [...h, created]);
-  }
-  async function patchHolding(id, patch) {
-    const updated = await apiSend("PUT", `/holdings/${id}`, patch);
-    setHoldings((hs) => hs.map((h) => (h._id === id ? updated : h)));
-  }
-  async function removeHolding(id) {
-    await apiSend("DELETE", `/holdings/${id}`);
-    setHoldings((hs) => hs.filter((h) => h._id !== id));
-  }
-
   const sortedCandidates = useMemo(() => {
     const arr = [...candidates];
     arr.sort((a, b) => {
@@ -215,19 +201,21 @@ export default function App() {
     }
   }
 
-  function addCandidateToHoldings(candidate) {
+  async function addCandidateToHoldings(candidate) {
     const entryPrice = candidate.price ?? 0;
     const stop = +(entryPrice * 0.775).toFixed(2);
-    addHolding({
-      symbol: candidate.symbol,
-      name: candidate.name || "",
-      entryPrice,
-      stopPrice: stop,
-      shares: 0,
-      entryDate: new Date().toISOString().slice(0, 10),
-      stage: "watching",
-      note: "",
-    });
+    try {
+      await apiSend("POST", "/diamond-holdings", {
+        symbol: candidate.symbol,
+        entry_date: new Date().toISOString().slice(0, 10),
+        shares: 0,
+        entry_price: entryPrice,
+        stop_loss: stop,
+        note: candidate.name || null,
+      });
+    } catch (e) {
+      setJobError(e.message);
+    }
     setTab("holdings");
   }
 
@@ -279,15 +267,7 @@ export default function App() {
               />
             )}
             {tab === "calc" && <CalcTab settings={settings} setSettings={saveSettings} />}
-            {tab === "holdings" && (
-              <HoldingsTab
-                holdings={holdings}
-                addHolding={addHolding}
-                patchHolding={patchHolding}
-                removeHolding={removeHolding}
-                openChart={openChart}
-              />
-            )}
+            {tab === "holdings" && <DiamondHoldingsTab openChart={openChart} />}
             {tab === "momentum" && <MomentumTab />}
             {tab === "sop" && <SopTab />}
           </>
@@ -998,193 +978,6 @@ function CalcTab({ settings, setSettings }) {
           ]}
         />
       </Panel>
-    </div>
-  );
-}
-
-/* ============================================================
-   Tab 3: 持股追蹤
-   ============================================================ */
-const STAGE_LABELS = {
-  watching: { label: "觀察中", tone: "muted" },
-  entered: { label: "已進場", tone: "gold" },
-  profit_zone: { label: "已達停利線", tone: "green" },
-  closed: { label: "已出場", tone: "muted" },
-};
-
-function HoldingsTab({ holdings, addHolding, patchHolding, removeHolding, openChart }) {
-  function addBlank() {
-    addHolding({
-      symbol: "",
-      name: "",
-      entryPrice: 0,
-      stopPrice: 0,
-      shares: 0,
-      entryDate: new Date().toISOString().slice(0, 10),
-      stage: "watching",
-      note: "",
-    });
-  }
-
-  return (
-    <div>
-      <Panel eyebrow={`共 ${holdings.length} 筆`} title="持股追蹤表">
-        {holdings.length === 0 ? (
-          <EmptyState text="尚無追蹤中的持股，可從「選股清單」加入候選股，或直接新增一筆。" />
-        ) : (
-          <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-            {holdings.map((h) => (
-              <HoldingCard
-                key={h._id}
-                holding={h}
-                onChange={(patch) => patchHolding(h._id, patch)}
-                onRemove={() => removeHolding(h._id)}
-                openChart={openChart}
-              />
-            ))}
-          </div>
-        )}
-        <div style={{ marginTop: 16 }}>
-          <GhostButton onClick={addBlank}>+ 手動新增持股</GhostButton>
-        </div>
-      </Panel>
-
-      <Panel eyebrow="出場邏輯提醒" title="漁夫式出場法（達停利線後）">
-        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          <ExitRow tone="gold" label="短期出場" detail="股價跌破 SMA20（收盤）→ 賣出 1/4" />
-          <ExitRow tone="gold" label="中期出場" detail="股價跌破 EMA60（高點）→ 賣出 1/2" />
-          <ExitRow tone="gold" label="長期出場" detail="股價跌破 EMA120（高點）→ 賣出剩餘 1/4" />
-        </div>
-        <p style={{ color: "#8B90A0", fontSize: 13, marginTop: 14, lineHeight: 1.7 }}>
-          停損線～停利線之間為「真空區」：價格未觸及上下限之前，不操作、持續觀察。
-          一旦盤中觸及 +20% 停利線，記得把停損線拉高至進場價，鎖住本金。
-        </p>
-      </Panel>
-    </div>
-  );
-}
-
-function HoldingCard({ holding, onChange, onRemove, openChart }) {
-  const stage = STAGE_LABELS[holding.stage] || STAGE_LABELS.watching;
-  return (
-    <div
-      style={{
-        border: "1px solid #23262f",
-        background: "#181a21",
-        padding: 16,
-        display: "flex",
-        flexWrap: "wrap",
-        gap: 14,
-        alignItems: "flex-end",
-      }}
-    >
-      <div style={{ minWidth: 90 }}>
-        <MiniLabel>代碼</MiniLabel>
-        <input
-          value={holding.symbol}
-          onChange={(e) => onChange({ symbol: e.target.value.toUpperCase() })}
-          style={inputStyle}
-          placeholder="AAPL"
-        />
-      </div>
-      <div style={{ minWidth: 100 }}>
-        <MiniLabel>進場價</MiniLabel>
-        <input
-          type="number"
-          value={holding.entryPrice}
-          onChange={(e) => onChange({ entryPrice: parseFloat(e.target.value) || 0 })}
-          style={inputStyle}
-        />
-      </div>
-      <div style={{ minWidth: 100 }}>
-        <MiniLabel>停損價</MiniLabel>
-        <input
-          type="number"
-          value={holding.stopPrice}
-          onChange={(e) => onChange({ stopPrice: parseFloat(e.target.value) || 0 })}
-          style={inputStyle}
-        />
-      </div>
-      <div style={{ minWidth: 90 }}>
-        <MiniLabel>股數</MiniLabel>
-        <input
-          type="number"
-          value={holding.shares}
-          onChange={(e) => onChange({ shares: parseInt(e.target.value) || 0 })}
-          style={inputStyle}
-        />
-      </div>
-      <div style={{ minWidth: 130 }}>
-        <MiniLabel>進場日期</MiniLabel>
-        <input
-          type="date"
-          value={holding.entryDate}
-          onChange={(e) => onChange({ entryDate: e.target.value })}
-          style={inputStyle}
-        />
-      </div>
-      <div style={{ minWidth: 140 }}>
-        <MiniLabel>階段</MiniLabel>
-        <select
-          value={holding.stage}
-          onChange={(e) => onChange({ stage: e.target.value })}
-          style={{ ...inputStyle, cursor: "pointer" }}
-        >
-          {Object.entries(STAGE_LABELS).map(([k, v]) => (
-            <option key={k} value={k}>
-              {v.label}
-            </option>
-          ))}
-        </select>
-      </div>
-      <div style={{ flex: 1, minWidth: 160 }}>
-        <MiniLabel>備註</MiniLabel>
-        <input
-          value={holding.note}
-          onChange={(e) => onChange({ note: e.target.value })}
-          style={inputStyle}
-          placeholder="例：已拉高停損至進場價"
-        />
-      </div>
-      <Badge tone={stage.tone}>{stage.label}</Badge>
-      {holding.symbol && (
-        <GhostButton
-          small
-          onClick={() =>
-            openChart(holding.symbol, [
-              { label: "進場價", value: holding.entryPrice, color: "#E8C275" },
-              { label: "停損價", value: holding.stopPrice, color: "#E5484D" },
-            ])
-          }
-        >
-          看線圖
-        </GhostButton>
-      )}
-      <button
-        onClick={onRemove}
-        style={{
-          background: "none",
-          border: "1px solid #3a2020",
-          color: "#E5484D",
-          padding: "6px 10px",
-          cursor: "pointer",
-          fontSize: 12,
-          whiteSpace: "nowrap",
-          flexShrink: 0,
-        }}
-      >
-        刪除
-      </button>
-    </div>
-  );
-}
-
-function ExitRow({ label, detail, tone }) {
-  return (
-    <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-      <Facet size={10} tone={tone} />
-      <span style={{ fontWeight: 700, fontSize: 13, minWidth: 80, color: "#F1E4C6" }}>{label}</span>
-      <span style={{ fontSize: 13, color: "#C7CAD4" }}>{detail}</span>
     </div>
   );
 }

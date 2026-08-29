@@ -28,12 +28,14 @@ import requests as http_requests
 
 import storage
 import momentum
+import holdings_engine as he
 from engine import ScreenerConfig, run_screener, fetch_nasdaq_universe, analyze_pattern
 
 app = FastAPI(title="黑鑽選股系統 API")
 scheduler = BackgroundScheduler(timezone="UTC")
 SCHEDULE_JOB_ID = "full_market_scan"
 MOMENTUM_JOB_ID = "momentum_daily_check"
+DIAMOND_HOLDINGS_JOB_ID = "diamond_holdings_daily_check"
 
 # 個股快取有效時數：這段時間內已檢查過的股票，重新掃描時會直接沿用結果，不再打 Yahoo Finance
 CACHE_FRESHNESS_HOURS = float(os.environ.get("CACHE_FRESHNESS_HOURS", 24))
@@ -122,6 +124,47 @@ class MomentumHistoryNote(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# 黑鑽飆股策略 — 持股追蹤 models
+# ---------------------------------------------------------------------------
+class DiamondHoldingsSettings(BaseModel):
+    strategy_capital: float = 0
+    risk_pct: float = 1
+    auto_check_enabled: bool = False
+
+
+class DiamondExit(BaseModel):
+    reason: str
+    price: float
+    shares: float
+    date: str
+
+
+class DiamondPositionCreate(BaseModel):
+    symbol: str                 # 可含交易所前綴，例如 "NASDAQ:OESX"
+    entry_date: str
+    shares: float
+    entry_price: float
+    stop_loss: float
+    note: Optional[str] = None
+
+
+class DiamondPositionPatch(BaseModel):
+    symbol: Optional[str] = None
+    entry_date: Optional[str] = None
+    shares: Optional[float] = None
+    entry_price: Optional[float] = None
+    stop_loss: Optional[float] = None
+    note: Optional[str] = None
+    status: Optional[str] = None       # "open" | "closed"
+
+
+class DiamondExitAdd(BaseModel):
+    reason: str
+    price: float
+    shares: float
+    date: str
+
+
 # Settings
 # ---------------------------------------------------------------------------
 @app.get("/api/settings")
@@ -408,6 +451,13 @@ def on_startup():
         momentum_daily_job,
         trigger=CronTrigger(hour=21, minute=30),  # UTC 21:30，約當美股收盤後
         id=MOMENTUM_JOB_ID,
+        replace_existing=True,
+    )
+    # 黑鑽飆股持股追蹤：每天固定時間比對出場規則（內部會自行判斷 auto_check_enabled）
+    scheduler.add_job(
+        diamond_holdings_daily_job,
+        trigger=CronTrigger(hour=21, minute=45),
+        id=DIAMOND_HOLDINGS_JOB_ID,
         replace_existing=True,
     )
 
@@ -878,6 +928,249 @@ def import_momentum_history(req: MomentumImportRequest):
     storage.save("momentum_settings", settings)
 
     return {"imported_rows": len(history), "state": state}
+
+
+# ---------------------------------------------------------------------------
+# 黑鑽飆股策略 — 持股追蹤 + 出場規則自動比對
+# ---------------------------------------------------------------------------
+def _compute_holding_indicators(symbol: str, entry_date_str: str, profit_target_price: float):
+    """抓歷史日線，算現價、SMA20/EMA60/EMA120，以及「從進場日起是否曾經觸及過停利線」。"""
+    ticker_symbol = he.strip_exchange_prefix(symbol)
+    try:
+        ticker = yf.Ticker(ticker_symbol)
+        hist = ticker.history(period="2y", interval="1d")
+    except Exception as e:
+        return None, f"取得 {ticker_symbol} 歷史股價失敗: {e}"
+    if hist is None or hist.empty:
+        return None, f"查無 {ticker_symbol} 的歷史股價資料"
+
+    close = hist["Close"].dropna()
+    if close.empty:
+        return None, "沒有可用的收盤價資料"
+
+    current_price = round(float(close.iloc[-1]), 4)
+    sma20 = round(float(close.rolling(20).mean().iloc[-1]), 4) if len(close) >= 20 else None
+    ema60 = round(float(close.ewm(span=60, adjust=False).mean().iloc[-1]), 4) if len(close) >= 60 else None
+    ema120 = round(float(close.ewm(span=120, adjust=False).mean().iloc[-1]), 4) if len(close) >= 120 else None
+
+    ever_hit = False
+    try:
+        entry_date = datetime.strptime(entry_date_str, "%Y-%m-%d").date()
+        since_entry = close[close.index.date >= entry_date]
+        if not since_entry.empty:
+            ever_hit = bool(since_entry.max() >= profit_target_price)
+    except Exception:
+        pass
+
+    return {
+        "current_price": current_price,
+        "sma20": sma20,
+        "ema60": ema60,
+        "ema120": ema120,
+        "ever_hit_target": ever_hit,
+    }, None
+
+
+def _portfolio_summary(positions: list, capital: float) -> dict:
+    total_buy = sum(p.get("_fin", {}).get("buy_amount") or 0 for p in positions)
+    total_sell = sum(p.get("_fin", {}).get("sell_amount") or 0 for p in positions)
+    total_market_value = sum(p.get("_fin", {}).get("market_value") or 0 for p in positions)
+    total_unrealized = sum(p.get("_fin", {}).get("unrealized_pnl") or 0 for p in positions)
+    cash_on_hand = round(capital - total_buy + total_sell, 4)
+    net_worth = round(cash_on_hand + total_market_value, 4)
+    total_return = round((net_worth - capital) / capital, 6) if capital else None
+    return {
+        "strategy_capital": capital,
+        "total_buy_amount": round(total_buy, 4),
+        "total_sell_amount": round(total_sell, 4),
+        "total_market_value": round(total_market_value, 4),
+        "total_unrealized_pnl": round(total_unrealized, 4),
+        "cash_on_hand": cash_on_hand,
+        "net_worth": net_worth,
+        "total_return": total_return,
+    }
+
+
+def _annotate_position(p: dict, current_price: Optional[float] = None) -> dict:
+    price = current_price if current_price is not None else p.get("latest_price")
+    fin = he.compute_financials(p, price)
+    out = dict(p)
+    out["profit_target"] = he.profit_target(p["entry_price"])
+    out["_fin"] = fin
+    out.update(fin)
+    return out
+
+
+@app.get("/api/diamond-holdings/settings")
+def get_diamond_settings():
+    return storage.load("diamond_holdings_settings")
+
+
+@app.put("/api/diamond-holdings/settings")
+def put_diamond_settings(settings: DiamondHoldingsSettings):
+    storage.save("diamond_holdings_settings", settings.dict())
+    return settings.dict()
+
+
+@app.get("/api/diamond-holdings")
+def list_diamond_holdings():
+    positions = storage.load("diamond_holdings") or []
+    settings = storage.load("diamond_holdings_settings")
+    annotated = [_annotate_position(p) for p in positions]
+    summary = _portfolio_summary(annotated, settings.get("strategy_capital", 0))
+    for p in annotated:
+        p.pop("_fin", None)
+    return {"positions": annotated, "summary": summary}
+
+
+@app.post("/api/diamond-holdings")
+def add_diamond_holding(req: DiamondPositionCreate):
+    positions = storage.load("diamond_holdings") or []
+    position = {
+        "_id": uuid.uuid4().hex[:8],
+        "symbol": req.symbol.strip().upper(),
+        "entry_date": req.entry_date,
+        "shares": req.shares,
+        "entry_price": req.entry_price,
+        "stop_loss": req.stop_loss,
+        "note": req.note,
+        "status": "open",
+        "exits": [],
+        "ever_hit_target": False,
+        "alerted_1month": False,
+        "alerted_2month": False,
+        "alerted_sma20": False,
+        "alerted_ema60": False,
+        "alerted_ema120": False,
+        "alerted_fallback_entry": False,
+        "latest_price": None,
+        "latest_sma20": None,
+        "latest_ema60": None,
+        "latest_ema120": None,
+        "last_checked_at": None,
+        "last_alert": None,
+    }
+    positions.append(position)
+    storage.save("diamond_holdings", positions)
+    return _annotate_position(position)
+
+
+@app.put("/api/diamond-holdings/{position_id}")
+def patch_diamond_holding(position_id: str, patch: DiamondPositionPatch):
+    positions = storage.load("diamond_holdings") or []
+    for p in positions:
+        if p["_id"] == position_id:
+            data = patch.dict(exclude_unset=True)
+            if "symbol" in data and data["symbol"]:
+                data["symbol"] = data["symbol"].strip().upper()
+            p.update(data)
+            storage.save("diamond_holdings", positions)
+            return _annotate_position(p)
+    raise HTTPException(404, "找不到該筆持股")
+
+
+@app.delete("/api/diamond-holdings/{position_id}")
+def delete_diamond_holding(position_id: str):
+    positions = storage.load("diamond_holdings") or []
+    new_positions = [p for p in positions if p["_id"] != position_id]
+    storage.save("diamond_holdings", new_positions)
+    return {"deleted": position_id}
+
+
+@app.post("/api/diamond-holdings/{position_id}/exit")
+def add_diamond_exit(position_id: str, exit_req: DiamondExitAdd):
+    if exit_req.reason not in he.EXIT_REASONS:
+        raise HTTPException(400, f"原因必須是以下其中之一：{he.EXIT_REASONS}")
+    positions = storage.load("diamond_holdings") or []
+    for p in positions:
+        if p["_id"] == position_id:
+            exits = p.get("exits", [])
+            exits.append({"reason": exit_req.reason, "price": exit_req.price, "shares": exit_req.shares, "date": exit_req.date})
+            p["exits"] = exits
+            fin = he.compute_financials(p, p.get("latest_price"))
+            if fin["remaining_shares"] <= 0:
+                p["status"] = "closed"
+            storage.save("diamond_holdings", positions)
+            return _annotate_position(p)
+    raise HTTPException(404, "找不到該筆持股")
+
+
+def _check_diamond_holdings() -> dict:
+    """對所有還沒平倉的持股，抓最新指標、比對出場規則，觸發時發 Telegram 通知。回傳這次的檢查摘要。"""
+    positions = storage.load("diamond_holdings") or []
+    alerts = []
+    errors = []
+
+    for p in positions:
+        if p.get("status") == "closed":
+            continue
+        fin_before = he.compute_financials(p, p.get("latest_price"))
+        if fin_before["remaining_shares"] <= 0:
+            p["status"] = "closed"
+            continue
+
+        indicators, err = _compute_holding_indicators(p["symbol"], p["entry_date"], he.profit_target(p["entry_price"]))
+        if err:
+            errors.append(f"{p['symbol']}: {err}")
+            continue
+
+        p["latest_price"] = indicators["current_price"]
+        p["latest_sma20"] = indicators["sma20"]
+        p["latest_ema60"] = indicators["ema60"]
+        p["latest_ema120"] = indicators["ema120"]
+        p["last_checked_at"] = _now_iso()
+        if indicators["ever_hit_target"]:
+            p["ever_hit_target"] = True
+
+        try:
+            entry_date = datetime.strptime(p["entry_date"], "%Y-%m-%d").date()
+            holding_days = (datetime.now(timezone.utc).date() - entry_date).days
+        except Exception:
+            holding_days = None
+
+        rule = he.evaluate_exit_rule(
+            p,
+            current_price=indicators["current_price"],
+            holding_days=holding_days,
+            ever_hit_target=p["ever_hit_target"],
+            sma20=indicators["sma20"],
+            ema60=indicators["ema60"],
+            ema120=indicators["ema120"],
+        )
+
+        if rule:
+            flag = he.alert_flag_field(rule["rule"])
+            if flag:
+                p[flag] = True
+            suggested = round(p["shares"] * rule["fraction"])
+            remaining = fin_before["remaining_shares"]
+            suggested = min(suggested, remaining) if remaining else suggested
+            alert_text = (
+                f"[黑鑽飆股] {p['symbol']} 觸發出場規則：{rule['reason']}\n"
+                f"現價 ${indicators['current_price']:.2f}，建議出場約 {suggested} 股"
+                f"（目前未出清 {remaining} 股），進場價 ${p['entry_price']:.2f}，止損線 ${p['stop_loss']:.2f}。"
+            )
+            send_telegram_message(alert_text)
+            p["last_alert"] = {"rule": rule["rule"], "reason": rule["reason"], "date": _now_iso()}
+            alerts.append({"symbol": p["symbol"], "reason": rule["reason"], "suggested_shares": suggested})
+
+    storage.save("diamond_holdings", positions)
+    return {"checked_at": _now_iso(), "alerts": alerts, "errors": errors}
+
+
+@app.post("/api/diamond-holdings/check-now")
+def diamond_holdings_check_now():
+    return _check_diamond_holdings()
+
+
+def diamond_holdings_daily_job():
+    try:
+        settings = storage.load("diamond_holdings_settings")
+        if not settings.get("auto_check_enabled"):
+            return
+        _check_diamond_holdings()
+    except Exception as e:
+        print(f"[diamond-holdings] 每日排程失敗: {e}")
 
 
 # ---------------------------------------------------------------------------
