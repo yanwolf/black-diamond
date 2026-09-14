@@ -1,4 +1,15 @@
 import React, { useState, useEffect, useCallback } from "react";
+import {
+  ResponsiveContainer,
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  Legend,
+  ReferenceLine,
+} from "recharts";
 
 /* ============================================================
    超速大盤策略 (Momentum Overdrive) — 頁面元件
@@ -119,6 +130,10 @@ export default function MomentumTab() {
         <ImportPanel onImported={refresh} />
       )}
 
+      <PerformanceChartPanel history={history} settings={settings} />
+
+      <CapitalPanel settings={settings} onChanged={refresh} />
+
       <ManualOverridePanel state={state} onOverridden={refresh} />
 
       <SettingsPanel settings={settings} onSaved={refresh} />
@@ -127,6 +142,190 @@ export default function MomentumTab() {
 
       {history.length > 0 && <ImportPanel collapsedByDefault onImported={refresh} />}
     </div>
+  );
+}
+
+/* ---------- 績效比較圖：策略 vs 大盤 ---------- */
+function PerformanceChartPanel({ history, settings }) {
+  const rows = [...history]
+    .filter((h) => h.price !== null && h.price !== undefined)
+    .sort((a, b) => (a.date < b.date ? -1 : 1));
+
+  if (rows.length < 2) {
+    return (
+      <Panel eyebrow="績效比較" title="策略 vs 大盤（QQQ）累積報酬">
+        <EmptyState text="至少要有2筆讀值紀錄才能畫出走勢比較，先匯入歷史資料或累積幾次讀值。" />
+      </Panel>
+    );
+  }
+
+  const basePrice = rows[0].price;
+  const chartData = rows.map((h) => {
+    const benchmarkReturn = basePrice ? (h.price - basePrice) / basePrice : null;
+    // 優先用 mtm_cumulative_return（每次讀值都有），沒有的話退回已確認的 cumulative_return
+    const strategyReturn =
+      h.mtm_cumulative_return !== null && h.mtm_cumulative_return !== undefined
+        ? h.mtm_cumulative_return
+        : h.cumulative_return;
+    return {
+      date: h.date,
+      benchmark: benchmarkReturn !== null ? +(benchmarkReturn * 100).toFixed(2) : null,
+      strategy: strategyReturn !== null && strategyReturn !== undefined ? +(strategyReturn * 100).toFixed(2) : null,
+    };
+  });
+
+  const latest = chartData[chartData.length - 1];
+  const outperformance =
+    latest.strategy !== null && latest.benchmark !== null ? +(latest.strategy - latest.benchmark).toFixed(2) : null;
+
+  return (
+    <Panel eyebrow="績效比較" title="策略 vs 大盤（QQQ）累積報酬">
+      <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 16 }}>
+        <StatCard label="策略累積報酬" value={latest.strategy !== null ? `${latest.strategy}%` : "—"} tone={latest.strategy < 0 ? "red" : "green"} />
+        <StatCard
+          label={`${settings?.benchmark_symbol || "QQQ"} 買進持有累積報酬`}
+          value={latest.benchmark !== null ? `${latest.benchmark}%` : "—"}
+        />
+        <StatCard
+          label="超額報酬（策略 − 大盤）"
+          value={outperformance !== null ? `${outperformance > 0 ? "+" : ""}${outperformance}%` : "—"}
+          tone={outperformance < 0 ? "red" : "green"}
+          highlight
+        />
+      </div>
+
+      <div style={{ height: 320 }}>
+        <ResponsiveContainer width="100%" height="100%">
+          <LineChart data={chartData} margin={{ top: 8, right: 12, bottom: 0, left: 0 }}>
+            <CartesianGrid stroke="#20232c" vertical={false} />
+            <XAxis
+              dataKey="date"
+              tickFormatter={(d) => d.slice(2)}
+              stroke="#4A4E5A"
+              tick={{ fill: "#6B7080", fontSize: 10, fontFamily: "'JetBrains Mono', monospace" }}
+              minTickGap={40}
+            />
+            <YAxis
+              stroke="#4A4E5A"
+              tick={{ fill: "#6B7080", fontSize: 11, fontFamily: "'JetBrains Mono', monospace" }}
+              tickFormatter={(v) => `${v}%`}
+              width={54}
+            />
+            <Tooltip
+              contentStyle={{ background: "#0d0e12", border: "1px solid #2a2e38", fontSize: 12, fontFamily: "'JetBrains Mono', monospace" }}
+              labelStyle={{ color: "#8B90A0" }}
+              formatter={(value, name) => [`${value}%`, name === "strategy" ? "策略" : (settings?.benchmark_symbol || "QQQ")]}
+            />
+            <Legend
+              formatter={(value) => (value === "strategy" ? "策略" : settings?.benchmark_symbol || "QQQ")}
+              wrapperStyle={{ fontSize: 12, fontFamily: "'JetBrains Mono', monospace" }}
+            />
+            <ReferenceLine y={0} stroke="#3a3e4a" strokeDasharray="3 3" />
+            <Line type="monotone" dataKey="benchmark" stroke="#8B90A0" strokeWidth={1.5} dot={false} isAnimationActive={false} />
+            <Line type="monotone" dataKey="strategy" stroke="#E8C275" strokeWidth={2} dot={false} isAnimationActive={false} />
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+
+      <p style={{ color: "#5c6070", fontSize: 12, lineHeight: 1.7, marginTop: 14, marginBottom: 0 }}>
+        策略累積報酬採用每次讀值當下的市值估算（股數 × 交易標的當時價格 + 現金），
+        除以本金基準算出來；本金若中途有調整過（見下方「追加/提領本金」），
+        調整之後的區間會用新的本金基準計算，調整之前的歷史不會回頭改寫。
+        {settings?.benchmark_symbol || "QQQ"} 累積報酬則是單純買進持有、不做任何進出場的對照組。
+      </p>
+    </Panel>
+  );
+}
+
+/* ---------- 追加/提領本金 ---------- */
+function CapitalPanel({ settings, onChanged }) {
+  const [open, setOpen] = useState(false);
+  const [amount, setAmount] = useState(0);
+  const [note, setNote] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [log, setLog] = useState(null);
+
+  async function loadLog() {
+    try {
+      setLog(await apiGet("/momentum/capital-log"));
+    } catch {
+      /* 非關鍵資訊 */
+    }
+  }
+
+  useEffect(() => {
+    if (open) loadLog();
+  }, [open]);
+
+  async function submit() {
+    setBusy(true);
+    setMsg("");
+    try {
+      const result = await apiSend("POST", "/momentum/capital", { amount: Number(amount) || 0, note: note || null });
+      setMsg(`✓ 本金已調整為 $${fmt.money(result.settings.initial_capital)}，現金同步增加`);
+      setAmount(0);
+      setNote("");
+      await loadLog();
+      await onChanged();
+    } catch (e) {
+      setMsg("✗ " + e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (!open) {
+    return (
+      <Panel eyebrow="資金管理" title="追加 / 提領本金">
+        <p style={{ color: "#8B90A0", fontSize: 13, marginTop: 0, marginBottom: 12, lineHeight: 1.7 }}>
+          空手期間想追加資金、下次進場時放大部位，或需要從策略提領一部分現金，都在這裡調整。
+        </p>
+        <GhostButton small onClick={() => setOpen(true)}>
+          展開資金調整
+        </GhostButton>
+      </Panel>
+    );
+  }
+
+  return (
+    <Panel eyebrow="資金管理" title="追加 / 提領本金">
+      <p style={{ color: "#8B90A0", fontSize: 13, marginTop: 0, marginBottom: 14, lineHeight: 1.7 }}>
+        金額正數代表追加資金、負數代表提領。送出後本金基準跟現金會同步調整，
+        「整體帳戶報酬率」算的是「賺賠 ÷ 實際投入的本金」，不會把新存入的錢也算成獲利。
+        建議在「持有現金」的狀態下調整，避免跟持股中的部位混在一起。
+      </p>
+      <div style={{ display: "flex", gap: 16, flexWrap: "wrap", alignItems: "flex-end" }}>
+        <Field label="金額 (USD，負數代表提領)">
+          <input type="number" value={amount} onChange={(e) => setAmount(e.target.value)} style={inputStyle} />
+        </Field>
+        <Field label="備註（選填）">
+          <input value={note} onChange={(e) => setNote(e.target.value)} style={{ ...inputStyle, width: 220 }} placeholder="例：空手期間追加資金" />
+        </Field>
+        <GoldButton onClick={submit} disabled={busy}>
+          {busy ? "送出中…" : "送出調整"}
+        </GoldButton>
+        <GhostButton small onClick={() => setOpen(false)}>
+          收合
+        </GhostButton>
+      </div>
+      {msg && <div style={{ fontSize: 13, marginTop: 10, color: msg.startsWith("✓") ? "#4CC98A" : "#E5484D" }}>{msg}</div>}
+
+      {log && log.length > 0 && (
+        <div style={{ marginTop: 16, paddingTop: 16, borderTop: "1px solid #23262f" }}>
+          <MiniLabel>調整紀錄</MiniLabel>
+          <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 8 }}>
+            {[...log].reverse().map((e, i) => (
+              <div key={i} style={{ fontSize: 12, color: "#C7CAD4" }}>
+                {e.date.slice(0, 10)} · {e.amount >= 0 ? "+" : ""}
+                {fmt.money(e.amount)} · 調整後本金 ${fmt.money(e.resulting_capital)}
+                {e.note ? ` · ${e.note}` : ""}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </Panel>
   );
 }
 

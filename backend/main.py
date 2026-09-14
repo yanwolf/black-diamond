@@ -35,7 +35,6 @@ app = FastAPI(title="黑鑽選股系統 API")
 scheduler = BackgroundScheduler(timezone="UTC")
 SCHEDULE_JOB_ID = "full_market_scan"
 MOMENTUM_JOB_ID = "momentum_daily_check"
-MOMENTUM_REMINDER_JOB_ID = "momentum_reminder_check"
 DIAMOND_HOLDINGS_JOB_ID = "diamond_holdings_daily_check"
 
 # 個股快取有效時數：這段時間內已檢查過的股票，重新掃描時會直接沿用結果，不再打 Yahoo Finance
@@ -119,6 +118,11 @@ class MomentumStateOverride(BaseModel):
     shares: float = 0
     cash: float = 0
     note: Optional[str] = None   # 順便記錄這次為什麼手動override，會附加到最新一筆歷史紀錄
+
+
+class MomentumCapitalInjection(BaseModel):
+    amount: float                # 可為負數（減少本金/提領）
+    note: Optional[str] = None
 
 
 class MomentumTelegramTestRequest(BaseModel):
@@ -453,19 +457,12 @@ def on_startup():
     cfg = storage.load("schedule")
     if cfg.get("enabled"):
         _apply_schedule(cfg)
-    # 超速大盤策略：每天固定時間跑一次（內部會自行判斷今天要不要真的動作）
+    # 超速大盤策略：每天固定時間跑一次（內部會自行判斷今天要不要真的動作，
+    # 包含還沒確認的換倉每天提醒一次，直到使用者回報確認結果）
     scheduler.add_job(
         momentum_daily_job,
         trigger=CronTrigger(hour=21, minute=30),  # UTC 21:30，約當美股收盤後
         id=MOMENTUM_JOB_ID,
-        replace_existing=True,
-    )
-    # 超速大盤策略：開盤前的提醒（UTC 13:00，不管夏令/冬令時間都在美股開盤之前），
-    # 跟訊號發布當下的通知分開，降低使用者忘記在開盤日當天操作的機率
-    scheduler.add_job(
-        momentum_reminder_job,
-        trigger=CronTrigger(hour=13, minute=0),
-        id=MOMENTUM_REMINDER_JOB_ID,
         replace_existing=True,
     )
     # 黑鑽飆股持股追蹤：每天固定時間比對出場規則（內部會自行判斷 auto_check_enabled）
@@ -662,6 +659,20 @@ def run_momentum_check() -> dict:
         raise RuntimeError(f"取得 {settings['benchmark_symbol']} 收盤價失敗，請稍後再試")
 
     calc = momentum.compute_momentum(history, price)
+
+    # 記錄一份「現值估算」給績效圖表用：不管這次有沒有觸發換倉，都用目前實際持有的
+    # 股數/現金 × 交易標的當下價格，算出粗略市值與累積報酬，讓走勢圖不會因為
+    # 「這個月沒有換倉」就整月缺資料。這跟 total_value/cumulative_return 不同——
+    # 那兩個欄位只在使用者按「確認執行結果」回報真實成交後才會被寫入，
+    # 代表的是「已確認的真實帳務」，這裡的 mtm_* 純粹是估算用途。
+    mtm_price = _get_daily_close(settings["trade_symbol"], today)
+    mtm_total_value = None
+    mtm_cumulative_return = None
+    if mtm_price is not None:
+        mtm_total_value = round(state["shares"] * mtm_price + state["cash"], 2)
+        ic = settings.get("initial_capital") or 0
+        mtm_cumulative_return = round((mtm_total_value - ic) / ic, 6) if ic else None
+
     row = {
         "date": today.isoformat(),
         "price": price,
@@ -673,6 +684,9 @@ def run_momentum_check() -> dict:
         "position_value": None,
         "total_value": None,
         "cumulative_return": None,
+        "mtm_price": mtm_price,
+        "mtm_total_value": mtm_total_value,
+        "mtm_cumulative_return": mtm_cumulative_return,
         "note": None,
     }
 
@@ -762,40 +776,6 @@ def momentum_daily_job():
         print(f"[momentum] 每日排程失敗: {e}")
 
 
-def momentum_reminder_job():
-    """
-    在市場開盤前先提醒一次，跟訊號當天就發出的「訊號更新」通知分開，
-    降低使用者忘記在開盤日當天實際操作的機率。
-    每個 pending_trade 只提醒一次（用 reminded 旗標避免重複），
-    真正的換倉記錄仍由 momentum_daily_job 在收盤後處理。
-    """
-    try:
-        settings = storage.load("momentum_settings")
-        if not settings.get("auto_schedule_enabled"):
-            return
-        state = storage.load("momentum_state")
-        pending = state.get("pending_trade")
-        if not pending or pending.get("reminded"):
-            return
-
-        today = datetime.now(timezone.utc).date()
-        exec_date = date.fromisoformat(pending["execution_date"])
-        if today != exec_date:
-            return
-
-        action_label = momentum.ACTION_LABELS.get(pending["target_action"], pending["target_action"])
-        send_telegram_message(
-            f"[超速大盤] 提醒：今天（{exec_date}）美股開盤後，系統會自動依開盤價記錄"
-            f"「{action_label}」換倉（{settings['trade_symbol']}）。\n"
-            f"如果你要在真實帳戶跟著操作，記得今天要做，避免系統紀錄跟實際帳戶對不起來。"
-        )
-        pending["reminded"] = True
-        state["pending_trade"] = pending
-        storage.save("momentum_state", state)
-    except Exception as e:
-        print(f"[momentum] 提醒排程失敗: {e}")
-
-
 @app.get("/api/momentum/settings")
 def get_momentum_settings():
     return storage.load("momentum_settings")
@@ -837,6 +817,50 @@ def override_momentum_state(override: MomentumStateOverride):
             storage.save("momentum_history", history)
 
     return state
+
+
+@app.post("/api/momentum/capital")
+def inject_momentum_capital(req: MomentumCapitalInjection):
+    """
+    增加（或減少）投入超速大盤策略的本金，例如空手期間想追加資金、下次進場時部位放大。
+
+    處理方式：
+      - 本金基準（settings.initial_capital）跟著調整，確保「整體帳戶報酬率」
+        算的是「賺賠 ÷ 實際投入的本金」，不會把新存入的錢也算成獲利，也不會被拉低。
+        這是簡化處理：這筆調整之後的歷史紀錄都會用新的本金基準計算報酬率，
+        調整之前已經算好的歷史紀錄維持原樣（反映當時的實際狀況），不會回頭改寫。
+      - 現金部位（state.cash）同步增加，讓下次進場時有更多資金可以買進。
+      - 記錄到 momentum_capital_log，方便回頭查是什麼時候、為什麼調整過本金。
+    """
+    settings = storage.load("momentum_settings")
+    state = storage.load("momentum_state")
+
+    new_capital = round((settings.get("initial_capital") or 0) + req.amount, 2)
+    if new_capital < 0:
+        raise HTTPException(400, "調整後的本金不能是負數")
+
+    settings["initial_capital"] = new_capital
+    storage.save("momentum_settings", settings)
+
+    state["cash"] = round((state.get("cash") or 0) + req.amount, 2)
+    storage.save("momentum_state", state)
+
+    log = storage.load("momentum_capital_log")
+    entry = {
+        "date": _now_iso(),
+        "amount": req.amount,
+        "note": req.note,
+        "resulting_capital": new_capital,
+    }
+    log.append(entry)
+    storage.save("momentum_capital_log", log)
+
+    return {"settings": settings, "state": state, "entry": entry}
+
+
+@app.get("/api/momentum/capital-log")
+def get_momentum_capital_log():
+    return storage.load("momentum_capital_log")
 
 
 @app.put("/api/momentum/history/{row_date}/note")
@@ -1004,6 +1028,7 @@ def import_momentum_history(req: MomentumImportRequest):
             "execution_date": None, "execution_price": None,
             "shares_after": None, "cash_after": None,
             "position_value": None, "total_value": None, "cumulative_return": None,
+            "mtm_price": None, "mtm_total_value": None, "mtm_cumulative_return": None,
             "note": None,
         })
     storage.save("momentum_history", history)

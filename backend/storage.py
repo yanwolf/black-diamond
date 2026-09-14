@@ -49,6 +49,7 @@ DEFAULTS = {
         "pending_trade": None,         # {"execution_date":..., "target_action":...} 或 None
     },
     "momentum_history": [],
+    "momentum_capital_log": [],
     "diamond_holdings_settings": {
         "strategy_capital": 0,
         "risk_pct": 1,

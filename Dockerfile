@@ -1,8 +1,8 @@
 # ---------- Stage 1: 打包前端 ----------
 FROM node:20-alpine AS frontend-build
 WORKDIR /app/frontend
-COPY frontend/package.json ./
-RUN npm install --no-fund --no-audit
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci --no-fund --no-audit
 COPY frontend/ ./
 RUN npm run build
 
