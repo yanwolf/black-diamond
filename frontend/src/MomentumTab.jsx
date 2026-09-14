@@ -155,66 +155,146 @@ function StatusPanel({ state, history, settings, onRefresh }) {
 
   const positionLabel = state?.position === "stock" ? "持有股票" : "持有現金";
   const positionTone = state?.position === "stock" ? "gold" : "muted";
+  const hasPending = state?.pending_trade && !state.pending_trade.confirmed;
 
   return (
-    <Panel eyebrow="超速大盤策略" title="目前狀態">
-      <div style={{ display: "flex", gap: 14, flexWrap: "wrap", alignItems: "center", marginBottom: 16 }}>
-        <Badge tone={positionTone}>{positionLabel}</Badge>
-        {state?.pending_trade && (
-          <Badge tone="red">
-            待換倉：{state.pending_trade.execution_date} 開盤執行「
-            {state.pending_trade.target_action === "hold_stock" ? "買進" : "賣出"}」
-          </Badge>
-        )}
-      </div>
+    <>
+      {hasPending && <PendingTradePanel pending={state.pending_trade} settings={settings} onResolved={onRefresh} />}
 
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))",
-          gap: 14,
-        }}
-      >
-        <StatCard label="持有股數" value={fmt.money(state?.shares)} />
-        <StatCard label="持有現金" value={`$${fmt.money(state?.cash)}`} />
-        <StatCard label="資產總額（上次成交後）" value={latestWithValue ? `$${fmt.money(latestWithValue.total_value)}` : "—"} highlight />
-        <StatCard
-          label="累計報酬（上次成交後）"
-          value={latestWithValue ? fmt.pct(latestWithValue.cumulative_return) : "—"}
-          tone={latestWithValue && latestWithValue.cumulative_return < 0 ? "red" : "green"}
-        />
-        <StatCard label="最近讀值日" value={state?.last_check_date || "—"} />
-        <StatCard label="交易標的 / 基準" value={settings ? `${settings.trade_symbol} / ${settings.benchmark_symbol}` : "—"} />
-      </div>
-
-      <div style={{ marginTop: 20, paddingTop: 20, borderTop: "1px solid #23262f" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-          <GoldButton onClick={() => handleCheckNow(false)} disabled={checking}>
-            {checking ? "檢查中…" : "立即檢查一次"}
-          </GoldButton>
-          <GhostButton small onClick={() => handleCheckNow(true)} disabled={checking}>
-            強制重新檢查本月
-          </GhostButton>
-          {settings?.auto_schedule_enabled ? (
-            <Badge tone="green">已啟用自動排程（每月 {settings.check_day_of_month} 號檢查）</Badge>
-          ) : (
-            <Badge tone="muted">自動排程尚未啟用</Badge>
-          )}
+      <Panel eyebrow="超速大盤策略" title="目前狀態">
+        <div style={{ display: "flex", gap: 14, flexWrap: "wrap", alignItems: "center", marginBottom: 16 }}>
+          <Badge tone={positionTone}>{positionLabel}</Badge>
+          {hasPending && <Badge tone="red">有待確認的換倉，請見上方提醒</Badge>}
         </div>
-        {checkError && <div style={{ color: "#E5484D", fontSize: 13, marginTop: 10 }}>{checkError}</div>}
-        {checkResult && (
-          <div style={{ color: "#8B90A0", fontSize: 13, marginTop: 10 }}>
-            本次讀值：{checkResult.date} 價格 ${fmt.money(checkResult.price)}，綜合動能指標{" "}
-            {checkResult.momentum !== null ? fmt.pct(checkResult.momentum) : "資料不足"}，
-            建議「{checkResult.action === "hold_stock" ? "持有股票" : checkResult.action === "hold_cash" ? "持有現金" : "無法判斷"}」
-            {checkResult.execution_date && `，將於 ${checkResult.execution_date} 開盤換倉`}
+
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))",
+            gap: 14,
+          }}
+        >
+          <StatCard label="持有股數" value={fmt.money(state?.shares)} />
+          <StatCard label="持有現金" value={`$${fmt.money(state?.cash)}`} />
+          <StatCard label="資產總額（上次成交後）" value={latestWithValue ? `$${fmt.money(latestWithValue.total_value)}` : "—"} highlight />
+          <StatCard
+            label="累計報酬（上次成交後）"
+            value={latestWithValue ? fmt.pct(latestWithValue.cumulative_return) : "—"}
+            tone={latestWithValue && latestWithValue.cumulative_return < 0 ? "red" : "green"}
+          />
+          <StatCard label="最近讀值日" value={state?.last_check_date || "—"} />
+          <StatCard label="交易標的 / 基準" value={settings ? `${settings.trade_symbol} / ${settings.benchmark_symbol}` : "—"} />
+        </div>
+
+        <div style={{ marginTop: 20, paddingTop: 20, borderTop: "1px solid #23262f" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+            <GoldButton onClick={() => handleCheckNow(false)} disabled={checking}>
+              {checking ? "檢查中…" : "立即檢查一次"}
+            </GoldButton>
+            <GhostButton small onClick={() => handleCheckNow(true)} disabled={checking}>
+              強制重新檢查本月
+            </GhostButton>
+            {settings?.auto_schedule_enabled ? (
+              <Badge tone="green">已啟用自動排程（每月 {settings.check_day_of_month} 號檢查）</Badge>
+            ) : (
+              <Badge tone="muted">自動排程尚未啟用</Badge>
+            )}
           </div>
-        )}
-        <p style={{ color: "#5c6070", fontSize: 12, lineHeight: 1.7, marginTop: 14, marginBottom: 0 }}>
-          每日排程會自動判斷「今天要不要換倉」與「是否輪到本月讀值」，這裡的按鈕只是方便手動測試或補跑。
-          換倉訊號在讀值當天判斷，實際換倉會等到隔一個交易日用開盤價執行（跟你原本Excel的「隔天日期」邏輯一致）。
-        </p>
+          {checkError && <div style={{ color: "#E5484D", fontSize: 13, marginTop: 10 }}>{checkError}</div>}
+          {checkResult && (
+            <div style={{ color: "#8B90A0", fontSize: 13, marginTop: 10 }}>
+              本次讀值：{checkResult.date} 價格 ${fmt.money(checkResult.price)}，綜合動能指標{" "}
+              {checkResult.momentum !== null ? fmt.pct(checkResult.momentum) : "資料不足"}，
+              建議「{checkResult.action === "hold_stock" ? "持有股票" : checkResult.action === "hold_cash" ? "持有現金" : "無法判斷"}」
+              {checkResult.execution_date && `，建議約 ${checkResult.execution_date} 開盤操作`}
+            </div>
+          )}
+          <p style={{ color: "#5c6070", fontSize: 12, lineHeight: 1.7, marginTop: 14, marginBottom: 0 }}>
+            每日排程會自動判斷「是否輪到本月讀值」，這裡的按鈕只是方便手動測試或補跑。
+            <strong style={{ color: "#E8C275" }}>系統不會自動假設你已經操作</strong>——換倉訊號出現後，
+            要等你實際操作完、回來「確認執行結果」，股數/現金才會更新；在那之前每天都會提醒你，
+            不會因為你忘記操作就默默把紀錄改成「已完成」。
+          </p>
+        </div>
+      </Panel>
+    </>
+  );
+}
+
+/* ---------- 待確認換倉 ---------- */
+function PendingTradePanel({ pending, settings, onResolved }) {
+  const [executionDate, setExecutionDate] = useState(pending.suggested_execution_date || new Date().toISOString().slice(0, 10));
+  const [executionPrice, setExecutionPrice] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+
+  const actionLabel = pending.target_action === "hold_stock" ? "買進" : "賣出";
+
+  async function confirmExecuted() {
+    if (!executionPrice) {
+      setErr("請輸入實際成交價");
+      return;
+    }
+    setBusy(true);
+    setErr("");
+    try {
+      await apiSend("POST", "/momentum/confirm-trade", {
+        executed: true,
+        execution_date: executionDate,
+        execution_price: Number(executionPrice),
+      });
+      await onResolved();
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function skipSignal() {
+    setBusy(true);
+    setErr("");
+    try {
+      await apiSend("POST", "/momentum/confirm-trade", { executed: false });
+      await onResolved();
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Panel eyebrow="⚠ 需要你確認" title="有一筆換倉訊號尚未確認執行">
+      <p style={{ color: "#C7CAD4", fontSize: 13, lineHeight: 1.7, marginTop: 0 }}>
+        訊號產生於 <strong style={{ color: "#E8C275" }}>{pending.triggered_date}</strong>，建議
+        <strong style={{ color: "#E8C275" }}>「{actionLabel} {settings?.trade_symbol}」</strong>，
+        建議操作日約 {pending.suggested_execution_date}。
+        <strong style={{ color: "#F0787C" }}>系統目前還沒有更新股數/現金</strong>
+        ——如果你已經在券商實際操作，請填入實際成交價與日期後按「確認已執行」；
+        如果決定不跟這次訊號（或錯過時機不打算補做），請按「跳過這次訊號」，部位會維持原狀。
+      </p>
+      <div style={{ display: "flex", gap: 14, flexWrap: "wrap", alignItems: "flex-end" }}>
+        <Field label="實際成交日期">
+          <input type="date" value={executionDate} onChange={(e) => setExecutionDate(e.target.value)} style={inputStyle} />
+        </Field>
+        <Field label="實際成交價">
+          <input
+            type="number"
+            value={executionPrice}
+            onChange={(e) => setExecutionPrice(e.target.value)}
+            style={inputStyle}
+            placeholder={`${settings?.trade_symbol || ""} 成交價`}
+          />
+        </Field>
+        <GoldButton onClick={confirmExecuted} disabled={busy}>
+          {busy ? "處理中…" : "確認已執行"}
+        </GoldButton>
+        <GhostButton onClick={skipSignal} disabled={busy}>
+          跳過這次訊號
+        </GhostButton>
       </div>
+      {err && <div style={{ color: "#E5484D", fontSize: 13, marginTop: 10 }}>{err}</div>}
     </Panel>
   );
 }
@@ -619,7 +699,18 @@ function HistoryPanel({ history, onRefresh }) {
                       "—"
                     )}
                   </td>
-                  <td style={cellStyle}>{h.execution_date || "—"}</td>
+                  <td style={cellStyle}>
+                    {h.execution_date ? (
+                      <>
+                        {h.execution_date}
+                        {(h.execution_price === null || h.execution_price === undefined) && (
+                          <span style={{ color: "#8B7A46" }}> (建議，待確認)</span>
+                        )}
+                      </>
+                    ) : (
+                      "—"
+                    )}
+                  </td>
                   <td style={{ ...cellStyle, fontFamily: "'JetBrains Mono', monospace" }}>
                     {h.execution_price !== null && h.execution_price !== undefined ? `$${fmt.money(h.execution_price)}` : "—"}
                   </td>

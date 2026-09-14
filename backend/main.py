@@ -35,6 +35,7 @@ app = FastAPI(title="黑鑽選股系統 API")
 scheduler = BackgroundScheduler(timezone="UTC")
 SCHEDULE_JOB_ID = "full_market_scan"
 MOMENTUM_JOB_ID = "momentum_daily_check"
+MOMENTUM_REMINDER_JOB_ID = "momentum_reminder_check"
 DIAMOND_HOLDINGS_JOB_ID = "diamond_holdings_daily_check"
 
 # 個股快取有效時數：這段時間內已檢查過的股票，重新掃描時會直接沿用結果，不再打 Yahoo Finance
@@ -105,6 +106,12 @@ class MomentumImportRequest(BaseModel):
     shares: float = 0
     cash: float = 0
     initial_capital: float = 0
+
+
+class MomentumConfirmTradeRequest(BaseModel):
+    executed: bool
+    execution_date: Optional[str] = None
+    execution_price: Optional[float] = None
 
 
 class MomentumStateOverride(BaseModel):
@@ -453,6 +460,14 @@ def on_startup():
         id=MOMENTUM_JOB_ID,
         replace_existing=True,
     )
+    # 超速大盤策略：開盤前的提醒（UTC 13:00，不管夏令/冬令時間都在美股開盤之前），
+    # 跟訊號發布當下的通知分開，降低使用者忘記在開盤日當天操作的機率
+    scheduler.add_job(
+        momentum_reminder_job,
+        trigger=CronTrigger(hour=13, minute=0),
+        id=MOMENTUM_REMINDER_JOB_ID,
+        replace_existing=True,
+    )
     # 黑鑽飆股持股追蹤：每天固定時間比對出場規則（內部會自行判斷 auto_check_enabled）
     scheduler.add_job(
         diamond_holdings_daily_job,
@@ -633,8 +648,9 @@ def send_telegram_message(text: str) -> bool:
 def run_momentum_check() -> dict:
     """
     執行一次「讀值判斷」：抓基準ETF今日收盤價、計算動能指標、決定是否需要換倉。
-    若需要換倉，只會記錄「預計換倉」，實際成交要等隔天 momentum_daily_job 抓到開盤價才會執行、
-    對應原Excel「隔天日期／QLD開盤價」的兩階段流程。
+    若需要換倉，只會記錄「待確認換倉」並發通知建議動作——不會自動假設使用者已經下單、
+    也不會自動更新股數/現金。使用者實際操作後，要到前端按「確認執行結果」回報實際
+    成交價/日期，系統才會真的更新持股紀錄，避免使用者忘記操作時系統卻誤以為已完成。
     """
     today = datetime.now(timezone.utc).date()
     settings = storage.load("momentum_settings")
@@ -664,9 +680,15 @@ def run_momentum_check() -> dict:
     needs_trade = calc["action"] is not None and calc["action"] != prev_position
 
     if needs_trade:
-        exec_date = momentum.next_trading_day(today)
-        state["pending_trade"] = {"execution_date": exec_date.isoformat(), "target_action": calc["action"]}
-        row["execution_date"] = exec_date.isoformat()
+        suggested_date = momentum.next_trading_day(today)
+        state["pending_trade"] = {
+            "target_action": calc["action"],
+            "triggered_date": today.isoformat(),
+            "suggested_execution_date": suggested_date.isoformat(),
+            "confirmed": False,
+            "last_reminder_date": today.isoformat(),
+        }
+        row["execution_date"] = suggested_date.isoformat()  # 僅供顯示的建議日期，尚未真正執行
 
     state["last_check_date"] = today.isoformat()
     state["last_check_month"] = today.strftime("%Y-%m")
@@ -680,57 +702,42 @@ def run_momentum_check() -> dict:
         momentum_pct = f"{calc['momentum']*100:.1f}%" if calc["momentum"] is not None else "—"
         send_telegram_message(
             f"[超速大盤] 訊號更新：綜合動能指標 {momentum_pct}，建議「{action_label}」。\n"
-            f"將於 {row['execution_date']} 開盤依 {settings['trade_symbol']} 開盤價自動記錄換倉，"
-            f"請留意帳戶並視需要人工操作。"
+            f"請於下一個交易日（約 {row['execution_date']}）開盤自行操作 {settings['trade_symbol']}，"
+            f"操作完成後請到「超速大盤」頁面按「確認執行結果」回報實際成交價與日期，"
+            f"系統才會更新持股紀錄——在你確認之前不會假設交易已經完成，也不會更新股數/現金。"
         )
 
     return row
 
 
 def momentum_daily_job():
-    """每日排程：優先處理未完成的換倉（隔日開盤價執行），沒有的話再檢查是否輪到本月讀值判斷。"""
+    """
+    每日排程：
+      1. 有「待確認換倉」還沒確認 → 每天提醒一次（絕不自動幫你完成交易或更新股數/現金），
+         先不做別的事，避免疊加更多待確認事項。
+      2. 沒有待確認事項時，才檢查是否輪到本月的讀值判斷。
+    """
     try:
         today = datetime.now(timezone.utc).date()
         settings = storage.load("momentum_settings")
         state = storage.load("momentum_state")
 
         pending = state.get("pending_trade")
-        if pending:
-            exec_date = date.fromisoformat(pending["execution_date"])
-            if today >= exec_date:
-                open_price = _get_daily_open(settings["trade_symbol"], exec_date)
-                if open_price is not None:
-                    trade = momentum.execute_trade(
-                        pending["target_action"], open_price, state["shares"], state["cash"]
-                    )
-                    state["shares"] = trade["shares_after"]
-                    state["cash"] = trade["cash_after"]
-                    state["position"] = "stock" if trade["shares_after"] > 0 else "cash"
-                    state["pending_trade"] = None
-                    storage.save("momentum_state", state)
-
-                    history = storage.load("momentum_history")
-                    if history:
-                        h = history[-1]
-                        h["execution_date"] = exec_date.isoformat()
-                        h["execution_price"] = open_price
-                        h["shares_after"] = trade["shares_after"]
-                        h["cash_after"] = trade["cash_after"]
-                        total_value = round(trade["shares_after"] * open_price + trade["cash_after"], 2)
-                        h["position_value"] = round(trade["shares_after"] * open_price, 2)
-                        h["total_value"] = total_value
-                        ic = settings.get("initial_capital") or 0
-                        h["cumulative_return"] = round((total_value - ic) / ic, 6) if ic else None
-                        storage.save("momentum_history", history)
-
-                    if trade["traded"]:
-                        verb = "買進" if pending["target_action"] == "hold_stock" else "賣出"
-                        send_telegram_message(
-                            f"[超速大盤] 已於 {exec_date} 依開盤價 ${open_price:.2f} 完成{verb} "
-                            f"{settings['trade_symbol']}，目前持有 {trade['shares_after']} 股，"
-                            f"現金 ${trade['cash_after']:.2f}"
-                        )
-                return  # 這輪先處理完換倉執行，讀值判斷留給沒有 pending 時再做
+        if pending and not pending.get("confirmed", False):
+            if pending.get("last_reminder_date") != today.isoformat():
+                action_label = momentum.ACTION_LABELS.get(pending.get("target_action"))
+                ref_price = _get_daily_close(settings["trade_symbol"], today)
+                price_note = f"，{settings['trade_symbol']} 參考價 ${ref_price:.2f}" if ref_price is not None else ""
+                send_telegram_message(
+                    f"[超速大盤] 提醒：還有一筆換倉訊號「{action_label}」尚未確認執行{price_note}。\n"
+                    f"訊號產生於 {pending.get('triggered_date')}。如果已經操作，"
+                    f"請到「超速大盤」頁面按「確認執行結果」回報；如果決定不跟這次訊號，"
+                    f"也可以按「跳過這次訊號」。在你回報之前，系統不會更新持股紀錄。"
+                )
+                pending["last_reminder_date"] = today.isoformat()
+                state["pending_trade"] = pending
+                storage.save("momentum_state", state)
+            return  # 還有未確認的換倉時，先不進行新的月度讀值判斷
 
         if not settings.get("auto_schedule_enabled"):
             return
@@ -753,6 +760,40 @@ def momentum_daily_job():
         run_momentum_check()
     except Exception as e:
         print(f"[momentum] 每日排程失敗: {e}")
+
+
+def momentum_reminder_job():
+    """
+    在市場開盤前先提醒一次，跟訊號當天就發出的「訊號更新」通知分開，
+    降低使用者忘記在開盤日當天實際操作的機率。
+    每個 pending_trade 只提醒一次（用 reminded 旗標避免重複），
+    真正的換倉記錄仍由 momentum_daily_job 在收盤後處理。
+    """
+    try:
+        settings = storage.load("momentum_settings")
+        if not settings.get("auto_schedule_enabled"):
+            return
+        state = storage.load("momentum_state")
+        pending = state.get("pending_trade")
+        if not pending or pending.get("reminded"):
+            return
+
+        today = datetime.now(timezone.utc).date()
+        exec_date = date.fromisoformat(pending["execution_date"])
+        if today != exec_date:
+            return
+
+        action_label = momentum.ACTION_LABELS.get(pending["target_action"], pending["target_action"])
+        send_telegram_message(
+            f"[超速大盤] 提醒：今天（{exec_date}）美股開盤後，系統會自動依開盤價記錄"
+            f"「{action_label}」換倉（{settings['trade_symbol']}）。\n"
+            f"如果你要在真實帳戶跟著操作，記得今天要做，避免系統紀錄跟實際帳戶對不起來。"
+        )
+        pending["reminded"] = True
+        state["pending_trade"] = pending
+        storage.save("momentum_state", state)
+    except Exception as e:
+        print(f"[momentum] 提醒排程失敗: {e}")
 
 
 @app.get("/api/momentum/settings")
@@ -824,6 +865,60 @@ def momentum_check_now_endpoint(force: bool = False):
         return run_momentum_check()
     except Exception as e:
         raise HTTPException(502, str(e))
+
+
+@app.post("/api/momentum/confirm-trade")
+def confirm_momentum_trade(req: MomentumConfirmTradeRequest):
+    """
+    使用者實際操作完換倉後，回來回報結果——系統才會真的更新股數/現金。
+    executed=False 代表這次決定不跟這個訊號（例如忘記操作、或主觀判斷不跟），
+    部位維持原狀，只是把待確認狀態清掉，不會重複提醒。
+    """
+    state = storage.load("momentum_state")
+    pending = state.get("pending_trade")
+    if not pending:
+        raise HTTPException(400, "目前沒有待確認的換倉")
+
+    history = storage.load("momentum_history")
+    settings = storage.load("momentum_settings")
+    triggered_date = pending.get("triggered_date")
+
+    if req.executed:
+        if req.execution_price is None:
+            raise HTTPException(400, "請提供實際成交價")
+        exec_date = req.execution_date or datetime.now(timezone.utc).date().isoformat()
+
+        trade = momentum.execute_trade(pending["target_action"], req.execution_price, state["shares"], state["cash"])
+        state["shares"] = trade["shares_after"]
+        state["cash"] = trade["cash_after"]
+        state["position"] = "stock" if trade["shares_after"] > 0 else "cash"
+        state["pending_trade"] = None
+        storage.save("momentum_state", state)
+
+        for h in reversed(history):
+            if h.get("date") == triggered_date:
+                h["execution_date"] = exec_date
+                h["execution_price"] = req.execution_price
+                h["shares_after"] = trade["shares_after"]
+                h["cash_after"] = trade["cash_after"]
+                total_value = round(trade["shares_after"] * req.execution_price + trade["cash_after"], 2)
+                h["position_value"] = round(trade["shares_after"] * req.execution_price, 2)
+                h["total_value"] = total_value
+                ic = settings.get("initial_capital") or 0
+                h["cumulative_return"] = round((total_value - ic) / ic, 6) if ic else None
+                break
+        storage.save("momentum_history", history)
+        return {"confirmed": True, "state": state}
+    else:
+        state["pending_trade"] = None
+        storage.save("momentum_state", state)
+        for h in reversed(history):
+            if h.get("date") == triggered_date:
+                note = h.get("note")
+                h["note"] = (note + " / " if note else "") + "使用者選擇跳過此次換倉訊號，部位維持原狀"
+                break
+        storage.save("momentum_history", history)
+        return {"confirmed": False, "state": state}
 
 
 @app.post("/api/momentum/telegram-test")
