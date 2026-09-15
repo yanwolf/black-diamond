@@ -29,7 +29,7 @@ import requests as http_requests
 import storage
 import momentum
 import holdings_engine as he
-from engine import ScreenerConfig, run_screener, fetch_nasdaq_universe, analyze_pattern
+from engine import ScreenerConfig, run_screener, fetch_nasdaq_universe, analyze_pattern, with_retry
 
 app = FastAPI(title="黑鑽選股系統 API")
 scheduler = BackgroundScheduler(timezone="UTC")
@@ -545,7 +545,7 @@ def _get_history_payload(symbol: str, period: str = "5y", interval: str = "1wk")
             return cached[1]
 
     ticker = yf.Ticker(symbol)
-    hist = ticker.history(period=period, interval=interval)
+    hist = with_retry(lambda: ticker.history(period=period, interval=interval))
 
     if hist is None or hist.empty:
         raise ValueError(f"查無 {symbol} 的歷史股價資料")
@@ -586,8 +586,9 @@ def get_chart(symbol: str, period: str = "5y", interval: str = "1wk"):
 def _get_daily_close(symbol: str, on_date: date) -> Optional[float]:
     """抓 on_date 當天（或最近一個更早的交易日，例如遇到假日）的收盤價。"""
     try:
-        ticker = yf.Ticker(symbol)
-        hist = ticker.history(start=on_date - timedelta(days=10), end=on_date + timedelta(days=1), interval="1d")
+        hist = with_retry(lambda: yf.Ticker(symbol).history(
+            start=on_date - timedelta(days=10), end=on_date + timedelta(days=1), interval="1d"
+        ))
     except Exception:
         return None
     if hist is None or hist.empty:
@@ -604,8 +605,9 @@ def _is_trading_day(symbol: str, on_date: date) -> bool:
     美股假日（感恩節、聖誕節等）雖然是平日，市場一樣休市，這裡會一併偵測到。
     """
     try:
-        ticker = yf.Ticker(symbol)
-        hist = ticker.history(start=on_date, end=on_date + timedelta(days=1), interval="1d")
+        hist = with_retry(lambda: yf.Ticker(symbol).history(
+            start=on_date, end=on_date + timedelta(days=1), interval="1d"
+        ))
     except Exception:
         return False
     if hist is None or hist.empty:
@@ -616,8 +618,9 @@ def _is_trading_day(symbol: str, on_date: date) -> bool:
 def _get_daily_open(symbol: str, on_date: date) -> Optional[float]:
     """抓 on_date 當天（或往後找最近一個有資料的交易日）的開盤價。"""
     try:
-        ticker = yf.Ticker(symbol)
-        hist = ticker.history(start=on_date, end=on_date + timedelta(days=7), interval="1d")
+        hist = with_retry(lambda: yf.Ticker(symbol).history(
+            start=on_date, end=on_date + timedelta(days=7), interval="1d"
+        ))
     except Exception:
         return None
     if hist is None or hist.empty:
@@ -1161,8 +1164,7 @@ def _compute_holding_indicators(symbol: str, entry_date_str: str, profit_target_
     """抓歷史日線，算現價、SMA20/EMA60/EMA120，以及「從進場日起是否曾經觸及過停利線」。"""
     ticker_symbol = he.strip_exchange_prefix(symbol)
     try:
-        ticker = yf.Ticker(ticker_symbol)
-        hist = ticker.history(period="2y", interval="1d")
+        hist = with_retry(lambda: yf.Ticker(ticker_symbol).history(period="2y", interval="1d"))
     except Exception as e:
         return None, f"取得 {ticker_symbol} 歷史股價失敗: {e}"
     if hist is None or hist.empty:

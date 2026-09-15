@@ -250,11 +250,27 @@ def _to_float(val):
     return f
 
 
+def with_retry(fn, attempts: int = 3, base_delay: float = 1.5):
+    """
+    對容易因為 Yahoo Finance 暫時性限流（HTTP 429）、回應格式異常等問題失敗的呼叫，
+    重試幾次、間隔遞增，提高單次操作的成功率。這是 yfinance 生態系統很常見的問題
+    （Yahoo 端偶爾會擋掉來自雲端主機IP的請求），不一定代表程式碼或設定有問題。
+    """
+    last_exc = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as e:
+            last_exc = e
+            if i < attempts - 1:
+                time.sleep(base_delay * (i + 1))
+    raise last_exc
+
+
 def evaluate_symbol(symbol: str, cfg: ScreenerConfig = DEFAULT_CONFIG) -> CandidateResult:
     fail_reasons = []
     try:
-        ticker = yf.Ticker(symbol)
-        info = ticker.info or {}
+        info = with_retry(lambda: yf.Ticker(symbol).info) or {}
     except Exception as e:
         return CandidateResult(symbol=symbol, passed=False, fail_reasons=[f"資料取得失敗: {e}"])
 
