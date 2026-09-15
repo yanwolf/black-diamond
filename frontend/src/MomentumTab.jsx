@@ -130,7 +130,7 @@ export default function MomentumTab() {
         <ImportPanel onImported={refresh} />
       )}
 
-      <PerformanceChartPanel history={history} settings={settings} />
+      <PerformanceChartPanel history={history} settings={settings} onRefresh={refresh} />
 
       <CapitalPanel settings={settings} onChanged={refresh} />
 
@@ -146,10 +146,27 @@ export default function MomentumTab() {
 }
 
 /* ---------- 績效比較圖：策略 vs 大盤 ---------- */
-function PerformanceChartPanel({ history, settings }) {
+function PerformanceChartPanel({ history, settings, onRefresh }) {
+  const [backfilling, setBackfilling] = useState(false);
+  const [backfillMsg, setBackfillMsg] = useState("");
+
   const rows = [...history]
     .filter((h) => h.price !== null && h.price !== undefined)
     .sort((a, b) => (a.date < b.date ? -1 : 1));
+
+  async function doBackfill() {
+    setBackfilling(true);
+    setBackfillMsg("");
+    try {
+      const result = await apiSend("POST", "/momentum/backfill-mtm");
+      setBackfillMsg(`✓ 已補上 ${result.filled_rows} 筆歷史績效資料`);
+      await onRefresh();
+    } catch (e) {
+      setBackfillMsg("✗ " + e.message);
+    } finally {
+      setBackfilling(false);
+    }
+  }
 
   if (rows.length < 2) {
     return (
@@ -174,12 +191,37 @@ function PerformanceChartPanel({ history, settings }) {
     };
   });
 
+  const missingStrategyCount = chartData.filter((d) => d.strategy === null).length;
   const latest = chartData[chartData.length - 1];
   const outperformance =
     latest.strategy !== null && latest.benchmark !== null ? +(latest.strategy - latest.benchmark).toFixed(2) : null;
 
   return (
     <Panel eyebrow="績效比較" title="策略 vs 大盤（QQQ）累積報酬">
+      {missingStrategyCount > 0 && (
+        <div
+          style={{
+            marginBottom: 16,
+            padding: "10px 14px",
+            background: "rgba(201,161,90,0.1)",
+            border: "1px solid rgba(201,161,90,0.4)",
+            fontSize: 13,
+            color: "#E8C275",
+          }}
+        >
+          有 {missingStrategyCount} 筆讀值還沒有策略績效資料（通常是舊版匯入的歷史資料，
+          當時還沒有回測回填功能），策略線可能因此不連續或看不到。
+          <div style={{ marginTop: 8 }}>
+            <GhostButton small onClick={doBackfill} disabled={backfilling}>
+              {backfilling ? "回填中…" : "回填歷史績效資料"}
+            </GhostButton>
+          </div>
+          {backfillMsg && (
+            <div style={{ marginTop: 8, color: backfillMsg.startsWith("✓") ? "#4CC98A" : "#E5484D" }}>{backfillMsg}</div>
+          )}
+        </div>
+      )}
+
       <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 16 }}>
         <StatCard label="策略累積報酬" value={latest.strategy !== null ? `${latest.strategy}%` : "—"} tone={latest.strategy < 0 ? "red" : "green"} />
         <StatCard
@@ -221,8 +263,8 @@ function PerformanceChartPanel({ history, settings }) {
               wrapperStyle={{ fontSize: 12, fontFamily: "'JetBrains Mono', monospace" }}
             />
             <ReferenceLine y={0} stroke="#3a3e4a" strokeDasharray="3 3" />
-            <Line type="monotone" dataKey="benchmark" stroke="#8B90A0" strokeWidth={1.5} dot={false} isAnimationActive={false} />
-            <Line type="monotone" dataKey="strategy" stroke="#E8C275" strokeWidth={2} dot={false} isAnimationActive={false} />
+            <Line type="monotone" dataKey="benchmark" stroke="#8B90A0" strokeWidth={1.5} dot={false} isAnimationActive={false} connectNulls />
+            <Line type="monotone" dataKey="strategy" stroke="#E8C275" strokeWidth={2} dot={false} isAnimationActive={false} connectNulls />
           </LineChart>
         </ResponsiveContainer>
       </div>

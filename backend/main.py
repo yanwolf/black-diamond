@@ -1017,6 +1017,75 @@ def fetch_telegram_chat_id(payload: dict = Body(...)):
     return {"chat_id": str(chat_id), "display_name": display_name}
 
 
+def _backfill_backtest_mtm(history: list, initial_capital: float, trade_symbol: str):
+    """
+    對匯入的歷史讀值，回測模擬「如果從第一筆開始機械式照規則執行」的績效曲線，
+    讓績效比較圖從最早的讀值就有資料可畫，而不是只從真正開始追蹤之後才有資料。
+
+    只會回填最前面「還沒有市值估算」的連續區塊；一旦遇到已經有 mtm_total_value 的列
+    （代表從那之後開始有真實的即時追蹤），就停止，絕不會用回測數字覆蓋已經記錄的真實資料。
+
+    ⚠ 這是回測估算，反映的是「演算法建議動作」的理論績效，不是使用者當時
+    實際的真實操作（例如使用者曾經主觀override過的那幾次，這裡不會反映）。
+    """
+    if not history or not initial_capital:
+        return
+    try:
+        ticker = yf.Ticker(trade_symbol)
+        start = min(h["date"] for h in history)
+        end = max(h["date"] for h in history)
+        hist = ticker.history(
+            start=(datetime.strptime(start, "%Y-%m-%d") - timedelta(days=10)).date(),
+            end=(datetime.strptime(end, "%Y-%m-%d") + timedelta(days=1)).date(),
+            interval="1d",
+        )
+    except Exception as e:
+        print(f"[momentum] 回測回填失敗，略過（不影響匯入本身）: {e}")
+        return
+    if hist is None or hist.empty:
+        return
+    closes = hist["Close"].dropna()
+
+    def price_on_or_before(date_str):
+        d = datetime.strptime(date_str, "%Y-%m-%d").date()
+        subset = closes[closes.index.date <= d]
+        return float(subset.iloc[-1]) if not subset.empty else None
+
+    shares, cash = 0.0, initial_capital
+    for h in history:
+        if h.get("mtm_total_value") is not None:
+            break  # 從這裡開始已經有真實追蹤資料，停止回測回填
+        price = price_on_or_before(h["date"])
+        if price is None:
+            continue
+        prev_position = "hold_stock" if shares > 0 else "hold_cash"
+        action = h.get("action")
+        if action is not None and action != prev_position:
+            trade = momentum.execute_trade(action, price, shares, cash)
+            shares, cash = trade["shares_after"], trade["cash_after"]
+        total_value = round(shares * price + cash, 2)
+        h["mtm_price"] = round(price, 4)
+        h["mtm_total_value"] = total_value
+        h["mtm_cumulative_return"] = round((total_value - initial_capital) / initial_capital, 6)
+
+
+@app.post("/api/momentum/backfill-mtm")
+def backfill_momentum_mtm():
+    """
+    給已經匯入過歷史資料、但當時還沒有 mtm_* 回測回填功能的使用者用：
+    不用整批重新匯入（會重置持股狀態），只補上最前面缺資料的區塊。
+    """
+    history = storage.load("momentum_history")
+    if not history:
+        raise HTTPException(400, "目前沒有歷史紀錄可以回填")
+    settings = storage.load("momentum_settings")
+    before = sum(1 for h in history if h.get("mtm_total_value") is not None)
+    _backfill_backtest_mtm(history, settings.get("initial_capital") or 0, settings.get("trade_symbol", "QLD"))
+    after = sum(1 for h in history if h.get("mtm_total_value") is not None)
+    storage.save("momentum_history", history)
+    return {"filled_rows": after - before, "total_rows": len(history)}
+
+
 @app.post("/api/momentum/import")
 def import_momentum_history(req: MomentumImportRequest):
     rows_sorted = sorted(req.history, key=lambda r: r.date)
@@ -1031,6 +1100,10 @@ def import_momentum_history(req: MomentumImportRequest):
             "mtm_price": None, "mtm_total_value": None, "mtm_cumulative_return": None,
             "note": None,
         })
+
+    settings_for_backfill = storage.load("momentum_settings")
+    _backfill_backtest_mtm(history, req.initial_capital, settings_for_backfill.get("trade_symbol", "QLD"))
+
     storage.save("momentum_history", history)
 
     state = {
