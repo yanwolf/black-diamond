@@ -97,6 +97,12 @@ class MomentumSettings(BaseModel):
 class MomentumImportRow(BaseModel):
     date: str    # "YYYY-MM-DD"
     price: float
+    # 以下為選填：如果原本Excel有真實記錄當時的換倉/持倉狀態，可以一併帶入，
+    # 這樣績效圖用的就是真實歷史資料，不用靠回測估算。
+    execution_date: Optional[str] = None
+    execution_price: Optional[float] = None
+    shares_after: Optional[float] = None
+    cash_after: Optional[float] = None
 
 
 class MomentumImportRequest(BaseModel):
@@ -1092,15 +1098,40 @@ def import_momentum_history(req: MomentumImportRequest):
     history = []
     for r in rows_sorted:
         calc = momentum.compute_momentum(history, r.price)
-        history.append({
+        row = {
             "date": r.date, "price": r.price, **calc,
             "execution_date": None, "execution_price": None,
             "shares_after": None, "cash_after": None,
             "position_value": None, "total_value": None, "cumulative_return": None,
             "mtm_price": None, "mtm_total_value": None, "mtm_cumulative_return": None,
             "note": None,
-        })
+        }
+        # 如果這一列有帶真實的歷史持倉資料（原本Excel記錄的股數/現金/換倉價），
+        # 直接用真實數字算，不用等下面的回測回填去猜測。
+        if r.shares_after is not None and r.cash_after is not None:
+            ref_price = r.execution_price if r.execution_price is not None else r.price
+            position_value = round(r.shares_after * ref_price, 4)
+            total_value = round(position_value + r.cash_after, 4)
+            cumulative_return = (
+                round((total_value - req.initial_capital) / req.initial_capital, 6)
+                if req.initial_capital else None
+            )
+            row.update({
+                "execution_date": r.execution_date,
+                "execution_price": r.execution_price,
+                "shares_after": r.shares_after,
+                "cash_after": r.cash_after,
+                "position_value": position_value,
+                "total_value": total_value,
+                "cumulative_return": cumulative_return,
+                "mtm_price": ref_price,
+                "mtm_total_value": total_value,
+                "mtm_cumulative_return": cumulative_return,
+            })
+        history.append(row)
 
+    # 只有真的缺真實資料的列（上面沒帶shares_after/cash_after的），才會被這裡的
+    # 回測估算補上；已經有真實資料的列會被跳過，不會被覆蓋。
     settings_for_backfill = storage.load("momentum_settings")
     _backfill_backtest_mtm(history, req.initial_capital, settings_for_backfill.get("trade_symbol", "QLD"))
 

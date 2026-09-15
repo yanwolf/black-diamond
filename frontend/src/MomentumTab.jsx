@@ -49,30 +49,27 @@ const fmt = {
 };
 
 // 使用者附件Excel裡的真實歷史讀值，供一鍵匯入種子資料（只需匯入一次）
-const SEED_IMPORT_PAYLOAD = {
-  history: [
-    { date: "2025-05-12", price: 506.69 },
-    { date: "2025-06-11", price: 531.2 },
-    { date: "2025-07-11", price: 553.56 },
-    { date: "2025-08-11", price: 572.19 },
-    { date: "2025-09-11", price: 583.4 },
-    { date: "2025-10-10", price: 589.5 },
-    { date: "2025-11-11", price: 621.57 },
-    { date: "2025-12-11", price: 625.58 },
-    { date: "2026-01-09", price: 626.25 },
-    { date: "2026-02-11", price: 613.11 },
-    { date: "2026-03-11", price: 607.69 },
-    { date: "2026-04-13", price: 617.39 },
-    { date: "2026-05-12", price: 707.24 },
-    { date: "2026-06-11", price: 716.33 },
-    { date: "2026-07-10", price: 725.51 },
-    { date: "2026-08-17", price: 729.87 },
-  ],
-  position: "cash",
-  shares: 0,
-  cash: 730,
-  initial_capital: 580,
-};
+// 使用者附件Excel裡的真實歷史讀值，包含真實記錄的換倉日期/價格/股數/現金
+// （不是回測估算），供表格編輯器預填、一鍵匯入
+const SEED_ROWS = [
+  { date: "2025-05-12", price: 506.69, execution_date: "", execution_price: "", shares_after: 0, cash_after: 580 },
+  { date: "2025-06-11", price: 531.2, execution_date: "", execution_price: "", shares_after: 0, cash_after: 580 },
+  { date: "2025-07-11", price: 553.56, execution_date: "", execution_price: "", shares_after: 0, cash_after: 580 },
+  { date: "2025-08-11", price: 572.19, execution_date: "", execution_price: "", shares_after: 0, cash_after: 580 },
+  { date: "2025-09-11", price: 583.4, execution_date: "", execution_price: "", shares_after: 0, cash_after: 580 },
+  { date: "2025-10-10", price: 589.5, execution_date: "", execution_price: "", shares_after: 0, cash_after: 580 },
+  { date: "2025-11-11", price: 621.57, execution_date: "2025-11-12", execution_price: 72.43, shares_after: 8, cash_after: 0 },
+  { date: "2025-12-11", price: 625.58, execution_date: "2025-12-12", execution_price: 72.35, shares_after: 8, cash_after: 0 },
+  { date: "2026-01-09", price: 626.25, execution_date: "2026-01-12", execution_price: 72.2, shares_after: 8, cash_after: 0 },
+  { date: "2026-02-11", price: 613.11, execution_date: "2026-02-12", execution_price: 69.88, shares_after: 8, cash_after: 0 },
+  { date: "2026-03-11", price: 607.69, execution_date: "2026-03-12", execution_price: 66.78, shares_after: 8, cash_after: 0 },
+  { date: "2026-04-13", price: 617.39, execution_date: "2026-04-14", execution_price: 70.28, shares_after: 8, cash_after: 0 },
+  { date: "2026-05-12", price: 707.24, execution_date: "2026-05-13", execution_price: 91.38, shares_after: 8, cash_after: 0 },
+  { date: "2026-06-11", price: 716.33, execution_date: "2026-06-12", execution_price: 92.47, shares_after: 8, cash_after: 0 },
+  { date: "2026-07-10", price: 725.51, execution_date: "2026-07-13", execution_price: 91.68, shares_after: 8, cash_after: 0 },
+  { date: "2026-08-17", price: 729.87, execution_date: "2026-08-18", execution_price: 91.34, shares_after: 0, cash_after: 730 },
+];
+const SEED_META = { position: "cash", shares: 0, cash: 730, initial_capital: 580 };
 
 export default function MomentumTab() {
   const [settings, setSettings] = useState(null);
@@ -813,18 +810,83 @@ function SettingsPanel({ settings, onSaved }) {
   );
 }
 
-/* ---------- 匯入歷史資料 ---------- */
+/* ---------- 匯入歷史資料（表格編輯，不用手key JSON） ---------- */
 function ImportPanel({ onImported, collapsedByDefault }) {
   const [open, setOpen] = useState(!collapsedByDefault);
-  const [text, setText] = useState(JSON.stringify(SEED_IMPORT_PAYLOAD, null, 2));
+  const [rows, setRows] = useState(() => SEED_ROWS.map((r) => ({ ...r, _key: Math.random().toString(36).slice(2) })));
+  const [meta, setMeta] = useState(SEED_META);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
+  const [pasteText, setPasteText] = useState("");
+  const [pasteOpen, setPasteOpen] = useState(false);
+
+  function updateRow(key, field, value) {
+    setRows((rs) => rs.map((r) => (r._key === key ? { ...r, [field]: value } : r)));
+  }
+  function addRow() {
+    setRows((rs) => [
+      ...rs,
+      { _key: Math.random().toString(36).slice(2), date: "", price: "", execution_date: "", execution_price: "", shares_after: "", cash_after: "" },
+    ]);
+  }
+  function removeRow(key) {
+    setRows((rs) => rs.filter((r) => r._key !== key));
+  }
+
+  function parsePaste() {
+    // 貼上以Tab或逗號分隔的資料，每行對應：日期,基準價,換倉日期,換倉價,股數,現金（後4欄可留空）
+    const lines = pasteText.split("\n").map((l) => l.trim()).filter(Boolean);
+    const parsed = lines.map((line) => {
+      const cells = line.split(/\t|,/).map((c) => c.trim());
+      return {
+        _key: Math.random().toString(36).slice(2),
+        date: cells[0] || "",
+        price: cells[1] || "",
+        execution_date: cells[2] || "",
+        execution_price: cells[3] || "",
+        shares_after: cells[4] || "",
+        cash_after: cells[5] || "",
+      };
+    });
+    if (parsed.length > 0) {
+      setRows(parsed);
+      setPasteText("");
+      setPasteOpen(false);
+    }
+  }
 
   async function doImport() {
     setBusy(true);
     setMsg("");
     try {
-      const payload = JSON.parse(text);
+      const history = rows
+        .filter((r) => r.date && r.price !== "")
+        .map((r) => {
+          const row = { date: r.date, price: Number(r.price) };
+          if (r.execution_date) row.execution_date = r.execution_date;
+          if (r.execution_price !== "" && r.execution_price !== undefined && r.execution_price !== null) {
+            row.execution_price = Number(r.execution_price);
+          }
+          if (r.shares_after !== "" && r.shares_after !== undefined && r.shares_after !== null) {
+            row.shares_after = Number(r.shares_after);
+          }
+          if (r.cash_after !== "" && r.cash_after !== undefined && r.cash_after !== null) {
+            row.cash_after = Number(r.cash_after);
+          }
+          return row;
+        });
+      if (history.length === 0) {
+        setMsg("✗ 至少要有一列填了日期跟基準價");
+        setBusy(false);
+        return;
+      }
+      const payload = {
+        history,
+        position: meta.position,
+        shares: Number(meta.shares) || 0,
+        cash: Number(meta.cash) || 0,
+        initial_capital: Number(meta.initial_capital) || 0,
+      };
       const result = await apiSend("POST", "/momentum/import", payload);
       setMsg(`✓ 已匯入 ${result.imported_rows} 筆歷史紀錄`);
       await onImported();
@@ -852,27 +914,130 @@ function ImportPanel({ onImported, collapsedByDefault }) {
     <Panel eyebrow={collapsedByDefault ? "進階 · 會覆蓋現有紀錄" : "STEP 01 · 匯入歷史資料"} title="匯入歷史讀值與目前部位">
       <p style={{ color: "#8B90A0", fontSize: 13, lineHeight: 1.7, marginTop: 0 }}>
         {collapsedByDefault
-          ? "下方已預填你原本Excel的紀錄格式，若要重新匯入請自行編輯後送出，會整個覆蓋現有的歷史紀錄與目前部位。"
-          : "已經幫你把附件Excel裡的歷史讀值與目前部位（持有現金 $730，本金 $580）整理成下方JSON，確認無誤後按「匯入」即可，之後系統就會自動接手，不用再手動維護Excel。"}
+          ? "下方已預填你原本Excel的紀錄，可以直接在表格裡編輯後送出，會整個覆蓋現有的歷史紀錄與目前部位。"
+          : "下方表格已經幫你把附件Excel裡的歷史讀值、真實換倉記錄（日期/價格/股數/現金）都填好了，"
+          + "確認無誤直接按「匯入」即可，之後系統就會自動接手，不用再手動維護Excel。"}
+        「換倉日期/換倉價/股數/現金」這四欄如果原本沒有真實記錄可以留空，
+        系統會在有網路資料的情況下自動用回測估算補上，但用真實紀錄會比較準。
       </p>
-      <textarea
-        value={text}
-        onChange={(e) => setText(e.target.value)}
-        style={{
-          width: "100%",
-          minHeight: 220,
-          background: "#0d0e12",
-          border: "1px solid #2a2e38",
-          color: "#EDEFF3",
-          fontFamily: "'JetBrains Mono', monospace",
-          fontSize: 12,
-          padding: 12,
-          boxSizing: "border-box",
-          resize: "vertical",
-        }}
-      />
-      {msg && <div style={{ fontSize: 13, marginTop: 10, color: msg.startsWith("✓") ? "#4CC98A" : "#E5484D" }}>{msg}</div>}
-      <div style={{ marginTop: 12 }}>
+
+      <div style={{ overflowX: "auto", marginTop: 12 }}>
+        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+          <thead>
+            <tr>
+              {["讀值日期", "基準價(QQQ)", "換倉日期", "換倉價(QLD)", "股數", "現金", ""].map((h) => (
+                <th
+                  key={h}
+                  style={{
+                    textAlign: "left",
+                    padding: "6px 8px",
+                    color: "#8B90A0",
+                    fontWeight: 500,
+                    borderBottom: "1px solid #23262f",
+                    whiteSpace: "nowrap",
+                    fontFamily: "'JetBrains Mono', monospace",
+                    fontSize: 11,
+                  }}
+                >
+                  {h}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr key={r._key} style={{ borderBottom: "1px solid #1c1f27" }}>
+                <td style={{ padding: 4 }}>
+                  <input type="date" value={r.date} onChange={(e) => updateRow(r._key, "date", e.target.value)} style={{ ...inputStyle, width: 130 }} />
+                </td>
+                <td style={{ padding: 4 }}>
+                  <input value={r.price} onChange={(e) => updateRow(r._key, "price", e.target.value)} style={{ ...inputStyle, width: 90 }} />
+                </td>
+                <td style={{ padding: 4 }}>
+                  <input type="date" value={r.execution_date} onChange={(e) => updateRow(r._key, "execution_date", e.target.value)} style={{ ...inputStyle, width: 130 }} />
+                </td>
+                <td style={{ padding: 4 }}>
+                  <input value={r.execution_price} onChange={(e) => updateRow(r._key, "execution_price", e.target.value)} style={{ ...inputStyle, width: 90 }} />
+                </td>
+                <td style={{ padding: 4 }}>
+                  <input value={r.shares_after} onChange={(e) => updateRow(r._key, "shares_after", e.target.value)} style={{ ...inputStyle, width: 70 }} />
+                </td>
+                <td style={{ padding: 4 }}>
+                  <input value={r.cash_after} onChange={(e) => updateRow(r._key, "cash_after", e.target.value)} style={{ ...inputStyle, width: 80 }} />
+                </td>
+                <td style={{ padding: 4 }}>
+                  <button
+                    onClick={() => removeRow(r._key)}
+                    style={{ background: "none", border: "1px solid #3a2020", color: "#E5484D", padding: "4px 8px", cursor: "pointer", fontSize: 11, whiteSpace: "nowrap" }}
+                  >
+                    刪除
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div style={{ marginTop: 10 }}>
+        <GhostButton small onClick={addRow}>
+          + 新增一列
+        </GhostButton>
+      </div>
+
+      <div style={{ marginTop: 16, paddingTop: 16, borderTop: "1px solid #23262f" }}>
+        <MiniLabel>目前部位與本金</MiniLabel>
+        <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginTop: 8 }}>
+          <Field label="部位">
+            <select value={meta.position} onChange={(e) => setMeta({ ...meta, position: e.target.value })} style={{ ...inputStyle, cursor: "pointer" }}>
+              <option value="cash">持有現金</option>
+              <option value="stock">持有股票</option>
+            </select>
+          </Field>
+          <Field label="目前股數">
+            <input value={meta.shares} onChange={(e) => setMeta({ ...meta, shares: e.target.value })} style={inputStyle} />
+          </Field>
+          <Field label="目前現金">
+            <input value={meta.cash} onChange={(e) => setMeta({ ...meta, cash: e.target.value })} style={inputStyle} />
+          </Field>
+          <Field label="本金基準">
+            <input value={meta.initial_capital} onChange={(e) => setMeta({ ...meta, initial_capital: e.target.value })} style={inputStyle} />
+          </Field>
+        </div>
+      </div>
+
+      <div style={{ marginTop: 16, paddingTop: 16, borderTop: "1px solid #23262f" }}>
+        {!pasteOpen ? (
+          <GhostButton small onClick={() => setPasteOpen(true)}>
+            改用貼上整批取代（進階）
+          </GhostButton>
+        ) : (
+          <div>
+            <MiniLabel>貼上整批資料（會取代上面表格），每行一筆，用逗號或Tab分隔：日期,基準價,換倉日期,換倉價,股數,現金</MiniLabel>
+            <textarea
+              value={pasteText}
+              onChange={(e) => setPasteText(e.target.value)}
+              placeholder={"2025-05-12,506.69\n2025-11-11,621.57,2025-11-12,72.43,8,0"}
+              style={{
+                width: "100%", minHeight: 100, background: "#0d0e12", border: "1px solid #2a2e38",
+                color: "#EDEFF3", fontFamily: "'JetBrains Mono', monospace", fontSize: 12, padding: 10,
+                boxSizing: "border-box", resize: "vertical", marginTop: 8,
+              }}
+            />
+            <div style={{ marginTop: 8, display: "flex", gap: 8 }}>
+              <GhostButton small onClick={parsePaste}>
+                套用到表格
+              </GhostButton>
+              <GhostButton small onClick={() => setPasteOpen(false)}>
+                取消
+              </GhostButton>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {msg && <div style={{ fontSize: 13, marginTop: 14, color: msg.startsWith("✓") ? "#4CC98A" : "#E5484D" }}>{msg}</div>}
+      <div style={{ marginTop: 14 }}>
         <GoldButton onClick={doImport} disabled={busy}>
           {busy ? "匯入中…" : "匯入"}
         </GoldButton>
