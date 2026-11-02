@@ -452,7 +452,8 @@ function ScreenTab({
   const [schedule, setSchedule] = useState(null);
   const [scheduleError, setScheduleError] = useState("");
   const [scheduleSaving, setScheduleSaving] = useState(false);
-  const [intervalDraft, setIntervalDraft] = useState(168);
+  const [weekdayDraft, setWeekdayDraft] = useState(0);
+  const [timeDraft, setTimeDraft] = useState("03:00");
 
   const [cacheStats, setCacheStats] = useState(null);
   const [cacheBusy, setCacheBusy] = useState(false);
@@ -461,7 +462,8 @@ function ScreenTab({
     try {
       const s = await apiGet("/scan/schedule");
       setSchedule(s);
-      setIntervalDraft(s.interval_hours);
+      setWeekdayDraft(s.weekday ?? 0);
+      setTimeDraft(s.time || "03:00");
     } catch (e) {
       setScheduleError(e.message);
     }
@@ -515,7 +517,9 @@ function ScreenTab({
     try {
       const s = await apiSend("PUT", "/scan/schedule", {
         enabled,
-        interval_hours: Number(intervalDraft) || 168,
+        schedule_mode: "weekly",
+        weekday: Number(weekdayDraft),
+        time: timeDraft || "03:00",
       });
       setSchedule(s);
     } catch (e) {
@@ -639,19 +643,34 @@ function ScreenTab({
           {schedule ? (
             <div style={{ display: "flex", alignItems: "flex-end", gap: 16, flexWrap: "wrap", marginTop: 6 }}>
               <div>
-                <MiniLabel>每隔幾小時掃描一次（約 {(Number(intervalDraft) / 24).toFixed(1)} 天）</MiniLabel>
+                <MiniLabel>每週哪一天</MiniLabel>
+                <select
+                  value={weekdayDraft}
+                  onChange={(e) => setWeekdayDraft(Number(e.target.value))}
+                  style={{ ...inputStyle, width: 110 }}
+                >
+                  {WEEKDAY_ZH.map((label, i) => (
+                    <option key={i} value={i}>{label}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <MiniLabel>時間（{tzLabel(schedule.timezone)}）</MiniLabel>
                 <input
-                  type="number"
-                  min="6"
-                  step="6"
-                  value={intervalDraft}
-                  onChange={(e) => setIntervalDraft(e.target.value)}
-                  style={{ ...inputStyle, width: 140 }}
+                  type="time"
+                  value={timeDraft}
+                  onChange={(e) => setTimeDraft(e.target.value)}
+                  style={{ ...inputStyle, width: 120 }}
                 />
               </div>
-              <GhostButton small onClick={() => setIntervalDraft(168)}>
-                每週一次
+              <GhostButton small onClick={() => { setWeekdayDraft(0); setTimeDraft("03:00"); }}>
+                週一 03:00（休市）
               </GhostButton>
+              {schedule.enabled && (Number(weekdayDraft) !== schedule.weekday || timeDraft !== schedule.time) && (
+                <GoldButton onClick={() => saveSchedule(true)}>
+                  {scheduleSaving ? "處理中…" : "更新時段"}
+                </GoldButton>
+              )}
               {schedule.enabled ? (
                 <GhostButton onClick={() => saveSchedule(false)} small={false}>
                   {scheduleSaving ? "處理中…" : "停用自動排程"}
@@ -662,7 +681,11 @@ function ScreenTab({
                 </GoldButton>
               )}
               <Badge tone={schedule.enabled ? "green" : "muted"}>
-                {schedule.enabled ? `每 ${schedule.interval_hours} 小時（約${(schedule.interval_hours / 24).toFixed(1)}天）自動掃描` : "尚未啟用"}
+                {!schedule.enabled
+                  ? "尚未啟用"
+                  : schedule.schedule_mode === "interval"
+                    ? `每 ${schedule.interval_hours} 小時（約${(schedule.interval_hours / 24).toFixed(1)}天）自動掃描`
+                    : `每${WEEKDAY_ZH[schedule.weekday] ?? "週一"} ${schedule.time}（${tzLabel(schedule.timezone)}）自動掃描`}
               </Badge>
             </div>
           ) : (
@@ -677,8 +700,8 @@ function ScreenTab({
           )}
           {scheduleError && <div style={{ color: "#E5484D", fontSize: 13, marginTop: 8 }}>{scheduleError}</div>}
           <div style={{ color: "#5c6070", fontSize: 11, marginTop: 10, lineHeight: 1.6 }}>
-            ⚠ 排程只在伺服器程序持續運行時有效；若服務重啟，排程會依照儲存的設定自動重新註冊，
-            但若當下距離下次應執行時間已過，會等到下一個整週期才觸發。
+            ⚠ 排程只在伺服器程序持續運行時有效；重新部署或重啟不會改變固定時段。
+            若錯過了上一個時段（例如當時服務停機），啟動後約 5 分鐘會補跑一次；但若離下一個時段不到 12 小時，就直接等下一個時段。
           </div>
         </div>
       </Panel>
@@ -1150,6 +1173,12 @@ function FieldNumber({ label, value, onChange, step = 1 }) {
       />
     </div>
   );
+}
+
+const WEEKDAY_ZH = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"];
+
+function tzLabel(tz) {
+  return !tz || tz === "Asia/Taipei" ? "台北時間" : tz;
 }
 
 function MiniLabel({ children }) {

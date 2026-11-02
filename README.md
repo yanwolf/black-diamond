@@ -351,6 +351,31 @@ JSON），欄位對應：讀值日期、基準價(QQQ)、換倉日期、換倉�
 就是字面上的意思——過幾分鐘到幾小時再試通常會恢復。如果長時間（例如超過一天）
 持續失敗，才需要懷疑是不是 Yahoo 又調整了什麼、需要進一步更新 yfinance 版本。
 
+## 每週排程：固定週一 03:00（台北時間）＋錯過補跑（2026-11-02）
+
+以前每週全市場掃描用 `IntervalTrigger(hours=168)`，從**容器啟動那一刻**開始算，
+每次 push 部署或 Restart 都會重新計時，連續幾天都有部署的話可能永遠不會掃。現在改成：
+
+- **每週固定時段**：預設**週一 03:00 台北時間**（= 美東週日下午，美股休市，拿到的是週五收盤後的完整資料）。
+  用 APScheduler 的 `CronTrigger`，重新部署、Restart 都不會改變時段。
+  儀表板「自動排程」可以改星期與時間；時區預設 `Asia/Taipei`，可用環境變數 `SCAN_TIMEZONE` 調整。
+- **錯過補跑一次**：啟動或修改排程時，會檢查最近一個已過的固定時段有沒有真的掃完
+  （`last_run_at` 早於那個時段 = 錯過，例如當時停機，或掃到一半容器重啟）。
+  錯過就在啟動後約 5 分鐘補跑一次（`SCAN_CATCHUP_DELAY_MINUTES` 可調），只補一次；
+  補跑完之後回到固定時段。若離下一個固定時段已不到 12 小時，就不補跑，直接等固定時段，避免短時間連掃兩次。
+- **`last_run_at` 只在全市場掃描真的完成時更新**，手動按「立即掃描」也算。掃描失敗不會更新，下次啟動就會補跑。
+- APScheduler 設定 `coalesce=True`、`max_instances=1`、`misfire_grace_time=3600`；
+  已有篩選工作在跑時，排程那輪仍會略過。
+- `schedule.json` 的 `next_run_at` 存的是排程器真正排定的時間。新增欄位（舊檔不需轉換，缺少時自動補預設值）：
+  `schedule_mode`（`weekly` 預設 / `interval`）、`weekday`（0=週一 … 6=週日）、`time`（`HH:MM`）、`timezone`、
+  `next_run_basis`（`initial` / `weekly` / `catchup`；interval 模式為 `last_run` / `interval`）。
+- **interval 模式仍保留**（API 送 `schedule_mode: "interval"` 才會啟用）：下次 = `last_run_at` + `interval_hours`，
+  沒有 `last_run_at` 時為現在 + interval，逾期同樣 5 分鐘後補跑一次。`interval_hours` 欄位意義不變，weekly 模式下不使用。
+- 每月超速大盤檢查（CronTrigger）不受影響。
+
+測試：`python -m unittest tests/test_weekly_schedule.py -v`（需先安裝 `backend/requirements.txt` 與 `httpx`；
+測試資料寫在暫存資料夾，不會碰到正式 Volume）。
+
 ## 已知限制
 
 - yfinance 抓取的是免費公開資料，準確度與更新頻率不如 ZACKS / Portfolio123，

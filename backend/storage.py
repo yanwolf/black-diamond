@@ -28,6 +28,11 @@ DEFAULTS = {
         "last_run_at": None,
         "last_result_count": None,
         "next_run_at": None,
+        # 以下為新增欄位：每週固定時段（週一 03:00 台北時間）
+        "schedule_mode": "weekly",
+        "weekday": 0,
+        "time": "03:00",
+        "timezone": "Asia/Taipei",
     },
     "symbol_cache": {},
     "momentum_settings": {

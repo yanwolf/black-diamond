@@ -37,6 +37,20 @@ SCHEDULE_JOB_ID = "full_market_scan"
 MOMENTUM_JOB_ID = "momentum_daily_check"
 DIAMOND_HOLDINGS_JOB_ID = "diamond_holdings_daily_check"
 
+# 每週全市場掃描：逾期補跑時，啟動後先等幾分鐘讓服務暖機再跑
+SCAN_CATCHUP_DELAY_MINUTES = float(os.environ.get("SCAN_CATCHUP_DELAY_MINUTES", 5))
+# 全市場掃描要對 Yahoo Finance 發出數千次請求，下限設為6小時避免掃太頻繁把來源打爆
+MIN_SCAN_INTERVAL_HOURS = 6
+# 排程觸發時若服務剛好忙碌而晚了，這段時間內仍會補執行（APScheduler 預設只有1秒）
+SCAN_MISFIRE_GRACE_SECONDS = 3600
+# 每週固定時段（schedule_mode="weekly"）的預設值：週一 03:00 台北時間，美股休市
+DEFAULT_SCAN_WEEKDAY = 0
+DEFAULT_SCAN_TIME = "03:00"
+DEFAULT_SCAN_TIMEZONE = os.environ.get("SCAN_TIMEZONE", "Asia/Taipei")
+# 錯過固定時段需要補跑時，如果離下一個固定時段已經不到這麼多小時，就不補跑，直接等固定時段（避免短時間內連掃兩次）
+SCAN_CATCHUP_SKIP_WITHIN_HOURS = 12
+WEEKDAY_CRON_NAMES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
 # 個股快取有效時數：這段時間內已檢查過的股票，重新掃描時會直接沿用結果，不再打 Yahoo Finance
 CACHE_FRESHNESS_HOURS = float(os.environ.get("CACHE_FRESHNESS_HOURS", 24))
 
@@ -80,7 +94,12 @@ class ScreenRequest(BaseModel):
 
 class ScheduleConfig(BaseModel):
     enabled: bool = False
-    interval_hours: float = 168   # 預設每週掃描一次
+    interval_hours: float = 168   # 預設每週掃描一次（僅 schedule_mode="interval" 時使用）
+    # 以下為新增欄位，沒帶就沿用 schedule.json 現有值
+    schedule_mode: Optional[str] = None   # "weekly"（每週固定時段，預設）| "interval"（每隔幾小時）
+    weekday: Optional[int] = None          # 0=週一 … 6=週日
+    time: Optional[str] = None             # "HH:MM"
+    timezone: Optional[str] = None         # 例如 "Asia/Taipei"
 
 
 class MomentumSettings(BaseModel):
@@ -340,10 +359,21 @@ def _run_job(symbols, cfg: ScreenerConfig, mode: str):
         with _job_lock:
             _job_state["error"] = None
         if mode == "nasdaq":
-            sched = storage.load("schedule")
+            # 只有掃描真的完成才更新 last_run_at（手動觸發的全市場掃描也算）；
+            # 失敗會走下面的 except，不會更新，下次啟動就能偵測逾期並補跑。
+            sched = dict(storage.load("schedule") or {})
             sched["last_run_at"] = _now_iso()
             sched["last_result_count"] = result.get("candidate_count")
-            storage.save("schedule", sched)
+            if sched.get("enabled"):
+                # 以這次完成時間為基準重排下一次（下次 = last_run_at + interval_hours），
+                # 會一併把正確的 next_run_at 寫回 schedule.json
+                try:
+                    _apply_schedule(sched)
+                except Exception as e:
+                    print(f"[scheduler] 掃描完成後重排排程失敗: {e}")
+                    storage.save("schedule", sched)
+            else:
+                storage.save("schedule", sched)
 
             # 全市場掃描完成後通知（跟超速大盤共用同一組 Telegram 設定），
             # 讓使用者知道可以進來做人工複核，不用一直開著網頁等
@@ -369,6 +399,9 @@ def _run_job(symbols, cfg: ScreenerConfig, mode: str):
         storage.save("symbol_cache", cache)  # 就算失敗也保留已查到的部分，避免全部浪費
         with _job_lock:
             _job_state["error"] = str(e)
+        if mode == "nasdaq":
+            # 失敗不更新 last_run_at；只把儀表板上的「下次排程」同步成排程器實際排定的時間
+            _sync_next_run_at_from_scheduler()
     finally:
         with _job_lock:
             _job_state["running"] = False
@@ -430,29 +463,184 @@ def _run_full_market_scan_job():
     except Exception as e:
         with _job_lock:
             _job_state["error"] = f"抓取上市清單失敗: {e}"
+        _sync_next_run_at_from_scheduler()
         return
     started = _start_job(symbols, ScreenerConfig(), "nasdaq")
     if not started:
         print("[scheduler] 略過本次排程：已有篩選工作正在執行中")
+        _sync_next_run_at_from_scheduler()
 
 
-def _apply_schedule(cfg: dict):
-    """依 schedule 設定重新註冊/移除 APScheduler 的定期任務。"""
+def _parse_iso_utc(value) -> Optional[datetime]:
+    """把 schedule.json 裡的 ISO 時間字串轉成 UTC aware datetime；空值或格式錯誤回傳 None。"""
+    if not value:
+        return None
+    try:
+        text = str(value).strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.fromisoformat(text)
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)   # 舊資料若沒有時區，一律視為 UTC
+    return dt.astimezone(timezone.utc)
+
+
+def compute_next_scan_run(last_run_at, interval_hours, now: Optional[datetime] = None,
+                          catchup_delay_minutes: float = SCAN_CATCHUP_DELAY_MINUTES):
+    """計算每週全市場掃描的下次執行時間，回傳 (next_run_at, basis)。
+
+    以「上次實際完成時間」為基準，不從容器啟動 / 修改排程的那一刻重新計時：
+      - 沒有 last_run_at（第一次使用）       → now + interval，basis="initial"
+      - last_run_at + interval 還沒到         → last_run_at + interval，basis="last_run"
+      - last_run_at + interval 已經過了（逾期）→ now + 暖機分鐘數補跑一次，basis="catchup"
+        （只補一次：補跑完成後會以那次完成時間為基準重新計算，不會把錯過的每一輪補回來）
+    """
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    interval = timedelta(hours=float(interval_hours))
+    last = _parse_iso_utc(last_run_at)
+    if last is None:
+        return now + interval, "initial"
+    if last > now:
+        last = now  # 時鐘異常（last_run_at 在未來）時，避免把下次排程推得過遠
+    candidate = last + interval
+    if candidate <= now:
+        return now + timedelta(minutes=catchup_delay_minutes), "catchup"
+    return candidate, "last_run"
+
+
+def _parse_hhmm(text):
+    """ "03:00" → (3, 0)；格式錯誤丟 ValueError。"""
+    hh, mm = str(text).strip().split(":")
+    hour, minute = int(hh), int(mm)
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError(f"時間超出範圍: {text}")
+    return hour, minute
+
+
+def _validate_timezone(name: str) -> str:
+    from pytz import timezone as pytz_timezone  # APScheduler 3.x 本身就依賴 pytz
+    pytz_timezone(name)  # 不存在會丟 UnknownTimeZoneError
+    return name
+
+
+def _schedule_mode(cfg: dict) -> str:
+    return "interval" if cfg.get("schedule_mode") == "interval" else "weekly"
+
+
+def _with_schedule_defaults(cfg: dict) -> dict:
+    """補上每週固定時段的新增欄位（舊的 schedule.json 沒有這些欄位，直接讀取即可）。
+    欄位值不合法時回退到預設值，避免一個壞值讓整個排程無法註冊。"""
+    cfg = dict(cfg or {})
+    cfg["schedule_mode"] = _schedule_mode(cfg)
+    try:
+        weekday = int(cfg.get("weekday"))
+        if not 0 <= weekday <= 6:
+            raise ValueError
+    except (TypeError, ValueError):
+        weekday = DEFAULT_SCAN_WEEKDAY
+    try:
+        hour, minute = _parse_hhmm(cfg.get("time") or DEFAULT_SCAN_TIME)
+    except (TypeError, ValueError):
+        hour, minute = _parse_hhmm(DEFAULT_SCAN_TIME)
+    try:
+        tz = _validate_timezone(cfg.get("timezone") or DEFAULT_SCAN_TIMEZONE)
+    except Exception:
+        tz = "Asia/Taipei"
+    cfg.update(weekday=weekday, time=f"{hour:02d}:{minute:02d}", timezone=tz)
+    return cfg
+
+
+def _weekly_cron_trigger(weekday: int, hour: int, minute: int, tz: str) -> CronTrigger:
+    return CronTrigger(day_of_week=WEEKDAY_CRON_NAMES[weekday], hour=hour, minute=minute, timezone=tz)
+
+
+def compute_next_weekly_scan_run(last_run_at, weekday: int, hour: int, minute: int, tz: str,
+                                 now: Optional[datetime] = None,
+                                 catchup_delay_minutes: float = SCAN_CATCHUP_DELAY_MINUTES,
+                                 skip_catchup_within_hours: float = SCAN_CATCHUP_SKIP_WITHIN_HOURS):
+    """每週固定時段模式的下次執行時間，回傳 (next_run_at, basis)。
+
+    固定時段本身不受重新部署影響；另外檢查「最近一個已過的固定時段」有沒有真的完成掃描：
+      - 沒有 last_run_at（第一次使用）              → 下一個固定時段，basis="initial"
+      - last_run_at 在最近一個已過時段之後（有掃到） → 下一個固定時段，basis="weekly"
+      - last_run_at 早於最近一個已過時段（錯過了）   → now + 暖機分鐘數補跑一次，basis="catchup"
+        但若下一個固定時段在 skip_catchup_within_hours 小時內，就不補跑，直接等固定時段。
+    """
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    trigger = _weekly_cron_trigger(weekday, hour, minute, tz)
+    next_slot = trigger.get_next_fire_time(None, now).astimezone(timezone.utc)
+    prev_slot = trigger.get_next_fire_time(None, now - timedelta(days=7)).astimezone(timezone.utc)
+    if prev_slot > now:
+        prev_slot = None
+    last = _parse_iso_utc(last_run_at)
+    if last is None:
+        return next_slot, "initial"
+    if prev_slot is not None and last < prev_slot:
+        if next_slot - now <= timedelta(hours=skip_catchup_within_hours):
+            return next_slot, "weekly"
+        return now + timedelta(minutes=catchup_delay_minutes), "catchup"
+    return next_slot, "weekly"
+
+
+def _sync_next_run_at_from_scheduler():
+    """把排程器實際排定的下次時間寫回 schedule.json（例如排程那輪失敗或被略過後）。"""
+    try:
+        job = scheduler.get_job(SCHEDULE_JOB_ID)
+        next_time = getattr(job, "next_run_time", None) if job else None
+        if not next_time:
+            return
+        sched = dict(storage.load("schedule") or {})
+        if not sched.get("enabled"):
+            return
+        sched["next_run_at"] = next_time.astimezone(timezone.utc).isoformat()
+        sched["next_run_basis"] = "weekly" if _schedule_mode(sched) == "weekly" else "interval"
+        storage.save("schedule", sched)
+    except Exception as e:
+        print(f"[scheduler] 同步 next_run_at 失敗: {e}")
+
+
+def _apply_schedule(cfg: dict, now: Optional[datetime] = None):
+    """依 schedule 設定重新註冊/移除 APScheduler 的全市場掃描任務。
+
+    - schedule_mode="weekly"（預設）：每週固定時段（預設週一 03:00 台北時間），CronTrigger。
+      錯過的時段會補跑一次（見 compute_next_weekly_scan_run）。
+    - schedule_mode="interval"：每 interval_hours 小時，以 last_run_at 為基準（見 compute_next_scan_run）。
+    每次掃描完成都會再呼叫本函式重新對齊。
+    """
+    cfg = _with_schedule_defaults(cfg)
     if scheduler.get_job(SCHEDULE_JOB_ID):
         scheduler.remove_job(SCHEDULE_JOB_ID)
     if cfg.get("enabled"):
-        # 全市場掃描要對 Yahoo Finance 發出數千次請求，下限設為6小時避免掃太頻繁把來源打爆
-        interval_hours = max(float(cfg.get("interval_hours", 168)), 6)
+        interval_hours = max(float(cfg.get("interval_hours") or 168), MIN_SCAN_INTERVAL_HOURS)
         cfg["interval_hours"] = interval_hours
+        if cfg["schedule_mode"] == "interval":
+            next_run, basis = compute_next_scan_run(cfg.get("last_run_at"), interval_hours, now=now)
+            trigger = IntervalTrigger(hours=interval_hours, start_date=next_run, timezone=timezone.utc)
+        else:
+            hour, minute = _parse_hhmm(cfg["time"])
+            next_run, basis = compute_next_weekly_scan_run(
+                cfg.get("last_run_at"), cfg["weekday"], hour, minute, cfg["timezone"], now=now,
+            )
+            trigger = _weekly_cron_trigger(cfg["weekday"], hour, minute, cfg["timezone"])
         job = scheduler.add_job(
             _run_full_market_scan_job,
-            trigger=IntervalTrigger(hours=interval_hours),
+            trigger=trigger,
+            # 明確指定第一次執行時間（補跑時間或固定時段）；之後由 trigger 接手排下一次
+            next_run_time=next_run,
             id=SCHEDULE_JOB_ID,
             replace_existing=True,
+            coalesce=True,          # 錯過多輪時只補一次
+            max_instances=1,
+            misfire_grace_time=SCAN_MISFIRE_GRACE_SECONDS,
         )
-        cfg["next_run_at"] = job.next_run_time.isoformat() if job.next_run_time else None
+        actual = getattr(job, "next_run_time", None) or next_run
+        cfg["next_run_at"] = actual.astimezone(timezone.utc).isoformat()
+        cfg["next_run_basis"] = basis   # initial / weekly / catchup（weekly 模式）；last_run / interval（interval 模式）
     else:
         cfg["next_run_at"] = None
+        cfg["next_run_basis"] = None
     storage.save("schedule", cfg)
     return cfg
 
@@ -499,15 +687,33 @@ def run_full_market_scan_now():
 
 @app.get("/api/scan/schedule")
 def get_schedule():
-    return storage.load("schedule")
+    return _with_schedule_defaults(storage.load("schedule"))
 
 
 @app.put("/api/scan/schedule")
 def put_schedule(cfg: ScheduleConfig):
-    saved = _apply_schedule(cfg.dict() | {
-        "last_run_at": storage.load("schedule").get("last_run_at"),
-        "last_result_count": storage.load("schedule").get("last_result_count"),
-    })
+    # 保留現有的 last_run_at / last_result_count 等欄位，只覆寫 enabled / interval_hours；
+    # 下次時間同樣以 last_run_at 為基準計算，不從修改的那一刻重新計時
+    patch = cfg.dict(exclude_unset=True)
+    patch = {k: v for k, v in patch.items() if v is not None}
+    if "schedule_mode" in patch and patch["schedule_mode"] not in ("weekly", "interval"):
+        raise HTTPException(400, "schedule_mode 只能是 weekly 或 interval")
+    if "weekday" in patch and not 0 <= patch["weekday"] <= 6:
+        raise HTTPException(400, "weekday 需介於 0（週一）到 6（週日）")
+    if "time" in patch:
+        try:
+            hour, minute = _parse_hhmm(patch["time"])
+        except (TypeError, ValueError):
+            raise HTTPException(400, "time 格式需為 HH:MM，例如 03:00")
+        patch["time"] = f"{hour:02d}:{minute:02d}"
+    if "timezone" in patch:
+        try:
+            _validate_timezone(patch["timezone"])
+        except Exception:
+            raise HTTPException(400, f"未知的時區: {patch['timezone']}")
+    current = dict(storage.load("schedule") or {})
+    current.update(patch)
+    saved = _apply_schedule(current)
     return saved
 
 
