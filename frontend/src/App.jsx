@@ -77,6 +77,7 @@ export default function App() {
 
   const [settings, setSettings] = useState({ totalCapital: 500000, riskPct: 1 });
   const [candidates, setCandidates] = useState([]);
+  const [excludedMa, setExcludedMa] = useState([]); // 被併購濾網自動排除的股票
   const [sortKey, setSortKey] = useState("pattern_score");
   const [sortDir, setSortDir] = useState("desc");
 
@@ -89,6 +90,7 @@ export default function App() {
   const refreshCandidates = useCallback(async () => {
     const c = await apiGet("/candidates");
     setCandidates((c.candidates || []).map((x, i) => ({ ...x, _id: x._id || `${x.symbol}-${i}` })));
+    setExcludedMa(c.excluded_ma || []);
     return c;
   }, []);
 
@@ -174,11 +176,19 @@ export default function App() {
   async function importCandidates(payload) {
     const data = await apiSend("POST", "/candidates/import", payload);
     setCandidates((data.candidates || []).map((x, i) => ({ ...x, _id: x._id || `${x.symbol}-${i}` })));
+    setExcludedMa(data.excluded_ma || []);
   }
 
   async function clearCandidates() {
     const data = await apiSend("DELETE", "/candidates");
     setCandidates(data.candidates || []);
+    setExcludedMa([]);
+  }
+
+  async function restoreExcluded(symbol) {
+    const data = await apiSend("POST", `/candidates/restore/${encodeURIComponent(symbol)}`);
+    setCandidates((data.candidates || []).map((x, i) => ({ ...x, _id: x._id || `${x.symbol}-${i}` })));
+    setExcludedMa(data.excluded_ma || []);
   }
 
   const sortedCandidates = useMemo(() => {
@@ -252,6 +262,8 @@ export default function App() {
             {tab === "screen" && (
               <ScreenTab
                 candidates={sortedCandidates}
+                excludedMa={excludedMa}
+                restoreExcluded={restoreExcluded}
                 importCandidates={importCandidates}
                 clearCandidates={clearCandidates}
                 sortKey={sortKey}
@@ -430,6 +442,8 @@ function Panel({ children, style = {}, title, eyebrow }) {
    ============================================================ */
 function ScreenTab({
   candidates,
+  excludedMa,
+  restoreExcluded,
   importCandidates,
   clearCandidates,
   sortKey,
@@ -790,6 +804,7 @@ function ScreenTab({
                         {c.symbol}
                       </button>
                       {c.name && <div style={{ fontSize: 11, color: "#6B7080" }}>{c.name}</div>}
+                      <MaBadge c={c} />
                       {c.needs_manual_review && (
                         <div style={{ fontSize: 11, color: "#E5484D", marginTop: 2 }}>
                           ⚠ {c.needs_manual_review}
@@ -836,6 +851,8 @@ function ScreenTab({
         )}
       </Panel>
 
+      <ExcludedMaPanel excluded={excludedMa} onRestore={restoreExcluded} />
+
       <Panel eyebrow="STEP 03 · 型態判斷" title="人工複核提醒">
         <p style={{ color: "#8B90A0", fontSize: 13, lineHeight: 1.7, marginTop: 0 }}>
           候選股清單裡的「型態分數」是電腦根據近2年價格區間夠不夠緊、夠不夠平、有沒有確認突破
@@ -870,16 +887,121 @@ function stickyColStyle(zIndex) {
 
 function JobProgress({ status }) {
   if (!status) return null;
-  const phaseLabel = status.phase === "pattern" ? "分析型態中" : "篩選中";
+  const phaseLabel = status.phase === "pattern" ? "分析型態中" : status.phase === "ma" ? "檢查併購消息中" : "篩選中";
+  const isScreening = status.phase !== "pattern" && status.phase !== "ma";
   return (
     <span style={{ fontSize: 12, color: "#8B90A0", fontFamily: "'JetBrains Mono', monospace" }}>
       {phaseLabel} {status.processed}/{status.total}
-      {status.phase !== "pattern" && <> · 目前：{status.current_symbol || "—"} · 已通過 {status.passed_so_far} 檔</>}
-      {status.phase === "pattern" && <> · 目前：{status.current_symbol || "—"}</>}
-      {(status.cache_hits > 0 || status.fresh_fetches > 0) && status.phase !== "pattern" && (
+      {isScreening && <> · 目前：{status.current_symbol || "—"} · 已通過 {status.passed_so_far} 檔</>}
+      {!isScreening && <> · 目前：{status.current_symbol || "—"}</>}
+      {(status.cache_hits > 0 || status.fresh_fetches > 0) && isScreening && (
         <> · 快取 {status.cache_hits} / 新查 {status.fresh_fetches}</>
       )}
     </span>
+  );
+}
+
+const MA_ROLE_LABEL = { target: "被收購方", acquirer: "收購方", unclear: "角色不明" };
+
+/* 候選股列上的併購標記：只有「收購方待判斷」「檢查失敗」「手動救回」才顯示，沒事的股票不加噪音。
+   顏色刻意不用紅色（紅色留給真正的警示），待判斷用金色。 */
+function MaBadge({ c }) {
+  if (c.ma_manually_restored) {
+    return <Badge tone="muted">併購：已手動救回</Badge>;
+  }
+  if (c.ma_status === "review") {
+    return (
+      <div style={{ marginTop: 4 }}>
+        <Badge tone="gold">併購：收購方・待判斷</Badge>
+        <MaEvidence evidence={c.ma_evidence} compact />
+      </div>
+    );
+  }
+  if (c.ma_status === "unknown") {
+    return (
+      <div style={{ marginTop: 4 }} title={c.ma_note || ""}>
+        <Badge tone="muted">併購檢查失敗</Badge>
+      </div>
+    );
+  }
+  return null;
+}
+
+function MaEvidence({ evidence, compact }) {
+  if (!evidence || evidence.length === 0) return null;
+  return (
+    <div style={{ marginTop: 4, display: "flex", flexDirection: "column", gap: 3 }}>
+      {evidence.slice(0, compact ? 2 : 6).map((e, i) => (
+        <div key={i} style={{ fontSize: 11, color: "#8B90A0", lineHeight: 1.5 }}>
+          {e.date || "—"} · {e.source === "edgar" ? "EDGAR" : "新聞"} ·{" "}
+          {e.url ? (
+            <a href={e.url} target="_blank" rel="noreferrer" style={{ color: "#C9A15A" }}>
+              {e.text}
+            </a>
+          ) : (
+            e.text
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* 被併購濾網自動排除的股票：附原因與證據，可以人工救回（關鍵字可能誤判） */
+function ExcludedMaPanel({ excluded, onRestore }) {
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState("");
+  const [err, setErr] = useState("");
+  if (!excluded || excluded.length === 0) return null;
+
+  async function restore(symbol) {
+    setBusy(symbol);
+    setErr("");
+    try {
+      await onRestore(symbol);
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  return (
+    <Panel eyebrow={`併購濾網 · 已自動排除 ${excluded.length} 檔`} title="因併購消息排除的股票">
+      <p style={{ color: "#8B90A0", fontSize: 13, lineHeight: 1.7, marginTop: 0 }}>
+        被收購方與角色不明的股票會自動排除（被收購的股價通常鎖在收購價附近，走勢像低位盤整突破但沒有後續動能）。
+        關鍵字判斷可能誤判，點「救回」可以放回候選清單，會標成「已手動救回」。
+      </p>
+      {!open ? (
+        <GhostButton small onClick={() => setOpen(true)}>
+          展開清單
+        </GhostButton>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          {excluded.map((c) => (
+            <div key={c.symbol} style={{ border: "1px solid #23262f", background: "#181a21", padding: 12 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                <div>
+                  <span style={{ fontWeight: 700, color: "#F1E4C6" }}>{c.symbol}</span>{" "}
+                  <Badge tone="muted">{MA_ROLE_LABEL[c.ma_role] || "已排除"}</Badge>
+                  {c.name && <div style={{ fontSize: 11, color: "#6B7080" }}>{c.name}</div>}
+                </div>
+                <GhostButton small onClick={() => restore(c.symbol)} disabled={busy === c.symbol}>
+                  {busy === c.symbol ? "處理中…" : "救回"}
+                </GhostButton>
+              </div>
+              <MaEvidence evidence={c.ma_evidence} />
+            </div>
+          ))}
+          <div>
+            <GhostButton small onClick={() => setOpen(false)}>
+              收合
+            </GhostButton>
+          </div>
+        </div>
+      )}
+      {err && <div style={{ color: "#E5484D", fontSize: 13, marginTop: 10 }}>{err}</div>}
+    </Panel>
   );
 }
 
@@ -1139,18 +1261,19 @@ function GoldButton({ children, onClick, disabled }) {
   );
 }
 
-function GhostButton({ children, onClick, small }) {
+function GhostButton({ children, onClick, small, disabled }) {
   return (
     <button
       onClick={onClick}
+      disabled={disabled}
       style={{
         background: "none",
         border: "1px solid #3a3e4a",
-        color: "#C7CAD4",
+        color: disabled ? "#5c6070" : "#C7CAD4",
         padding: small ? "5px 10px" : "10px 18px",
         fontWeight: 500,
         fontSize: small ? 12 : 13,
-        cursor: "pointer",
+        cursor: disabled ? "not-allowed" : "pointer",
         whiteSpace: "nowrap",
         flexShrink: 0,
       }}

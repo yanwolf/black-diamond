@@ -200,6 +200,7 @@ class SchedulerIntegrationTests(unittest.TestCase):
                     else mock.Mock(side_effect=RuntimeError("模擬 Yahoo 失敗")))
         with mock.patch.object(main, "run_screener", screener), \
              mock.patch.object(main, "_annotate_pattern_scores", lambda c: None), \
+             mock.patch.object(main, "_apply_ma_filter", lambda r: None), \
              mock.patch.object(main, "send_telegram_message", lambda t: True):
             with main._job_lock:
                 main._job_state["running"] = True

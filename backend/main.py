@@ -29,6 +29,7 @@ import requests as http_requests
 import storage
 import momentum
 import holdings_engine as he
+import ma_filter
 from engine import ScreenerConfig, run_screener, fetch_nasdaq_universe, analyze_pattern, with_retry
 
 app = FastAPI(title="黑鑽選股系統 API")
@@ -301,6 +302,46 @@ def _now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
+def _apply_ma_filter(result: dict):
+    """
+    對候選股做併購檢查（見 ma_filter.py）：被收購方/角色不明 → 移到 result["excluded_ma"]，
+    收購方保留但標「待判斷」。這是輔助階段，就算整批失敗也不該讓篩選結果作廢（呼叫端有 try/except）。
+    """
+    if not ma_filter.ENABLED:
+        return
+    candidates = result.get("candidates", [])
+    with _job_lock:
+        _job_state.update(phase="ma", processed=0, total=len(candidates), current_symbol=None)
+
+    def on_progress(i, total, symbol):
+        with _job_lock:
+            _job_state.update(processed=i, current_symbol=symbol)
+
+    kept, excluded = ma_filter.screen_candidates(candidates, progress=on_progress)
+    result["candidates"] = kept
+    result["excluded_ma"] = excluded
+    result["candidate_count"] = len(kept)
+    result["ma_excluded_count"] = len(excluded)
+
+
+@app.post("/api/candidates/restore/{symbol}")
+def restore_excluded_candidate(symbol: str):
+    """把被併購濾網排除的股票救回候選清單（關鍵字可能誤判，由人工決定）。"""
+    data = storage.load("candidates") or {}
+    excluded = data.get("excluded_ma") or []
+    target = next((c for c in excluded if c.get("symbol") == symbol.upper()), None)
+    if target is None:
+        raise HTTPException(404, f"已排除清單裡找不到 {symbol}")
+    data["excluded_ma"] = [c for c in excluded if c is not target]
+    target["ma_status"] = ma_filter.STATUS_REVIEW
+    target["ma_manually_restored"] = True
+    data.setdefault("candidates", []).append(target)
+    data["candidate_count"] = len(data["candidates"])
+    data["ma_excluded_count"] = len(data["excluded_ma"])
+    storage.save("candidates", data)
+    return data
+
+
 def _annotate_pattern_scores(candidates: list):
     """對已通過6道濾網的候選股，額外抓歷史週線計算型態分數（輔助排序，非取代人工判斷）。"""
     total = len(candidates)
@@ -355,6 +396,12 @@ def _run_job(symbols, cfg: ScreenerConfig, mode: str):
         except Exception:
             pass  # 型態分析是輔助功能，就算整批失敗也不該讓篩選結果整個作廢
 
+        # 型態分數算完後，檢查併購消息：被收購方/角色不明自動排除，收購方標「待判斷」
+        try:
+            _apply_ma_filter(result)
+        except Exception as e:
+            print(f"[ma_filter] 併購檢查失敗，略過此階段: {e}")
+
         storage.save("candidates", result)
         with _job_lock:
             _job_state["error"] = None
@@ -389,9 +436,17 @@ def _run_job(symbols, cfg: ScreenerConfig, mode: str):
                 top_lines = "  （尚未算出型態分數）"
             else:
                 top_lines = "  （本次無候選股通過濾網）"
+            review_n = sum(1 for c in candidates if c.get("ma_status") == "review")
+            ma_line = ""
+            if result.get("ma_excluded_count") or review_n:
+                ma_line = (
+                    f"併購濾網：排除 {result.get('ma_excluded_count', 0)} 檔"
+                    f"、{review_n} 檔收購方待你判斷。\n"
+                )
             send_telegram_message(
                 f"[黑鑽選股] 全市場掃描完成：從 {result.get('universe_size')} 檔中篩選出 "
                 f"{result.get('candidate_count')} 檔候選股。\n"
+                f"{ma_line}"
                 f"型態分數最高幾檔：\n{top_lines}\n"
                 f"請進來「選股清單」做人工複核。"
             )
